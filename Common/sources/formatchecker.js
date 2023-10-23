@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2019
+ * (c) Copyright Ascensio System SIA 2010-2023
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -12,7 +12,7 @@
  * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR  PURPOSE. For
  * details, see the GNU AGPL at: http://www.gnu.org/licenses/agpl-3.0.html
  *
- * You can contact Ascensio System SIA at 20A-12 Ernesta Birznieka-Upisha
+ * You can contact Ascensio System SIA at 20A-6 Ernesta Birznieka-Upish
  * street, Riga, Latvia, EU, LV-1050.
  *
  * The  interactive user interfaces in modified source and object code versions
@@ -34,11 +34,11 @@
 
 var path = require('path');
 var constants = require('./constants');
-var logger = require('./logger');
 
 function getImageFormatBySignature(buffer) {
   var length = buffer.length;
-  var startText = buffer.toString('ascii', 0, 20);
+  //1000 for svg(xml header and creator comment)
+  var startText = buffer.toString('ascii', 0, 1000);
 
   //jpeg
   // Hex: FF D8 FF
@@ -188,8 +188,8 @@ function getImageFormatBySignature(buffer) {
   }
 
   //svg
-  //работает для svg сделаных в редакторе, внешние svg могуть быть с пробелами в начале
-  if (0 == startText.indexOf('<svg')) {
+  //todo sax parser
+  if (-1 !== startText.indexOf('<svg')) {
     return constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_SVG;
   }
 
@@ -214,6 +214,7 @@ exports.getFormatFromString = function(ext) {
     case 'html':
       return constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_HTML;
     case 'mht':
+    case 'mhtml':
       return constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_MHT;
     case 'epub':
       return constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_EPUB;
@@ -500,27 +501,14 @@ exports.getStringFromFormat = function(format) {
       return '';
   }
 };
-exports.getImageFormat = function(buffer, optExt) {
+exports.getImageFormat = function(ctx, buffer) {
   var format = constants.AVS_OFFICESTUDIO_FILE_UNKNOWN;
   try {
     //signature
     format = getImageFormatBySignature(buffer);
-    //возвращаем тип по расширению
-    if (constants.AVS_OFFICESTUDIO_FILE_UNKNOWN == format && optExt) {
-      if ('.svg' == optExt) {
-        format = constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_SVG;
-      } else {
-        //пробуем по расширению
-        if (optExt.length > 0 && '.' == optExt[0]) {
-          optExt = optExt.substring(1);
-        }
-        format = exports.getFormatFromString(optExt);
-      }
-    }
   }
   catch (e) {
-    logger.error(optExt);
-    logger.error('error getImageFormat:\r\n%s', e.stack);
+    ctx.logger.error('error getImageFormat: %s', e.stack);
   }
   return format;
 };
@@ -538,4 +526,22 @@ exports.isPresentationFormat = function(format) {
   return 0 !== (format & constants.AVS_OFFICESTUDIO_FILE_PRESENTATION) ||
     format === constants.AVS_OFFICESTUDIO_FILE_CANVAS_PRESENTATION ||
     format === constants.AVS_OFFICESTUDIO_FILE_TEAMLAB_PPTY;
+};
+exports.isOOXFormat = function(format) {
+  return constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOCX === format
+  || constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOCM === format
+  || constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOTX === format
+  || constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOTM === format
+  || constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_OFORM === format
+  || constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_DOCXF === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_PPTX === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_PPSX === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_PPTM === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_PPSM === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_POTX === format
+  || constants.AVS_OFFICESTUDIO_FILE_PRESENTATION_POTM === format
+  || constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLSX === format
+  || constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLSM === format
+  || constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLTX === format
+  || constants.AVS_OFFICESTUDIO_FILE_SPREADSHEET_XLTM === format;
 };

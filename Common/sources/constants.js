@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2019
+ * (c) Copyright Ascensio System SIA 2010-2023
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -12,7 +12,7 @@
  * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR  PURPOSE. For
  * details, see the GNU AGPL at: http://www.gnu.org/licenses/agpl-3.0.html
  *
- * You can contact Ascensio System SIA at 20A-12 Ernesta Birznieka-Upisha
+ * You can contact Ascensio System SIA at 20A-6 Ernesta Birznieka-Upish
  * street, Riga, Latvia, EU, LV-1050.
  *
  * The  interactive user interfaces in modified source and object code versions
@@ -35,6 +35,7 @@
 exports.DOC_ID_PATTERN = '0-9-.a-zA-Z_=';
 exports.DOC_ID_REGEX = new RegExp("^[" + exports.DOC_ID_PATTERN + "]*$", 'i');
 exports.DOC_ID_REPLACE_REGEX = new RegExp("[^" + exports.DOC_ID_PATTERN + "]", 'g');
+exports.DOC_ID_SOCKET_PATTERN = new RegExp("^/doc/([" + exports.DOC_ID_PATTERN + "]*)/c.+", 'i');
 exports.DOC_ID_MAX_LENGTH = 240;
 exports.USER_ID_MAX_LENGTH = 240;//255-240=15 symbols to make user id unique
 exports.USER_NAME_MAX_LENGTH = 255;
@@ -45,6 +46,10 @@ exports.OUTPUT_NAME = 'output';
 exports.ONLY_OFFICE_URL_PARAM = 'ooname';
 exports.DISPLAY_PREFIX = 'display';
 exports.CHANGES_NAME = 'changes';
+exports.VIEWER_ONLY = /^(?:(pdf|djvu|xps|oxps))$/;
+exports.DEFAULT_DOC_ID = 'docId';
+exports.DEFAULT_USER_ID = 'userId';
+exports.ALLOWED_PROTO = /^https?$/i;
 
 exports.RIGHTS = {
   None    : 0,
@@ -72,10 +77,16 @@ exports.LICENSE_RESULT = {
   UsersCount    : 8,
   ConnectionsOS : 9,
   UsersCountOS  : 10,
-  ExpiredLimited: 11
+  ExpiredLimited: 11,
+  ConnectionsLiveOS: 12,
+  ConnectionsLive: 13,
+  UsersViewCount: 14,
+  UsersViewCountOS: 15,
+  NotBefore: 16
 };
 
-exports.LICENSE_CONNECTIONS = 99999;
+exports.LICENSE_CONNECTIONS = 9999;
+exports.LICENSE_USERS = 9999;
 exports.LICENSE_EXPIRE_USERS_ONE_DAY = 24 * 60 * 60; // day in seconds
 
 exports.AVS_OFFICESTUDIO_FILE_UNKNOWN =  0x0000;
@@ -202,6 +213,7 @@ exports.CONVERT_DRM = -90;
 exports.CONVERT_PASSWORD = -91;
 exports.CONVERT_ICU = -92;
 exports.CONVERT_LIMITS = -93;
+exports.CONVERT_DETECT = -95;
 exports.CONVERT_DEAD_LETTER = -99;
 exports.UPLOAD = -100;
 exports.UPLOAD_CONTENT_LENGTH = -101;
@@ -232,31 +244,9 @@ exports.PACKAGE_TYPE_OS = 0;
 exports.PACKAGE_TYPE_I = 1;
 exports.PACKAGE_TYPE_D = 2;
 
-exports.REDIS_KEY_PUBSUB = 'pubsub';
-exports.REDIS_KEY_SAVE_LOCK = 'savelock:';
-exports.REDIS_KEY_PRESENCE_HASH = 'presence:hash:';
-exports.REDIS_KEY_PRESENCE_SET = 'presence:set:';
-exports.REDIS_KEY_PRESENCE_UNIQUE_USERS = 'presence:unique:users';
-exports.REDIS_KEY_PRESENCE_UNIQUE_USERS_HASH = 'presence:unique:users:hash';
-exports.REDIS_KEY_PRESENCE_MONTH_UNIQUE_USERS_HASH = 'presence:unique:users:month';
-exports.REDIS_KEY_LOCKS = 'locks:';
-exports.REDIS_KEY_LOCK_DOCUMENT = 'lockdocument:';
-exports.REDIS_KEY_MESSAGE = 'message:';
-exports.REDIS_KEY_DOCUMENTS = 'documents';
-exports.REDIS_KEY_LAST_SAVE = 'lastsave:';
-exports.REDIS_KEY_FORCE_SAVE = 'forcesave:';
-exports.REDIS_KEY_FORCE_SAVE_TIMER = 'forcesavetimer';
-exports.REDIS_KEY_FORCE_SAVE_TIMER_LOCK = 'forcesavetimerlock:';
-exports.REDIS_KEY_SAVED = 'saved:';
 exports.REDIS_KEY_SHUTDOWN = 'shutdown';
-exports.REDIS_KEY_COLLECT_LOST = 'collectlost';
 exports.REDIS_KEY_LICENSE = 'license';
 exports.REDIS_KEY_LICENSE_T = 'licenseT';
-exports.REDIS_KEY_EDITOR_CONNECTIONS = 'editorconnections';
-exports.REDIS_KEY_SHARD_CONNECTIONS_EDIT_ZSET = 'shardconnections:edit:zset';
-exports.REDIS_KEY_SHARD_CONNECTIONS_EDIT_HASH = 'shardconnections:edit:hash';
-exports.REDIS_KEY_SHARD_CONNECTIONS_VIEW_ZSET = 'shardconnections:view:zset';
-exports.REDIS_KEY_SHARD_CONNECTIONS_VIEW_HASH = 'shardconnections:view:hash';
 
 exports.SHUTDOWN_CODE = 4001;
 exports.SHUTDOWN_REASON = 'server shutdown';
@@ -276,11 +266,13 @@ exports.UPDATE_VERSION_CODE = 4008;
 exports.UPDATE_VERSION = 'update version';
 exports.NO_CACHE_CODE = 4009;
 exports.NO_CACHE = 'no cache';
+exports.RESTORE_CODE = 4010;
+exports.RESTORE = 'no cache';
 
 exports.CONTENT_DISPOSITION_INLINE = 'inline';
 exports.CONTENT_DISPOSITION_ATTACHMENT = 'attachment';
 
-exports.CONN_CLOSED = 3;
+exports.CONN_CLOSED = "closed";
 
 exports.FILE_STATUS_OK = 'ok';
 exports.FILE_STATUS_UPDATE_VERSION = 'updateversion';

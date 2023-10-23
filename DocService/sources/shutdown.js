@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2019
+ * (c) Copyright Ascensio System SIA 2010-2023
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -12,7 +12,7 @@
  * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR  PURPOSE. For
  * details, see the GNU AGPL at: http://www.gnu.org/licenses/agpl-3.0.html
  *
- * You can contact Ascensio System SIA at 20A-12 Ernesta Birznieka-Upisha
+ * You can contact Ascensio System SIA at 20A-6 Ernesta Birznieka-Upish
  * street, Riga, Latvia, EU, LV-1050.
  *
  * The  interactive user interfaces in modified source and object code versions
@@ -45,53 +45,53 @@ var redisKeyShutdown = cfgRedisPrefix + constants.REDIS_KEY_SHUTDOWN;
 
 var WAIT_TIMEOUT = 30000;
 var LOOP_TIMEOUT = 1000;
-var EXEC_TIMEOUT = WAIT_TIMEOUT + utils.CONVERTION_TIMEOUT;
+var EXEC_TIMEOUT = WAIT_TIMEOUT + utils.getConvertionTimeout(undefined);
 
-exports.shutdown = function(editorData, status) {
+exports.shutdown = function(ctx, editorData, status) {
   return co(function*() {
     var res = true;
     try {
-      logger.debug('shutdown start:' + EXEC_TIMEOUT);
+      ctx.logger.debug('shutdown start:' + EXEC_TIMEOUT);
 
-      //redisKeyShutdown не простой счетчик, чтобы его не уменьшала сборка, которая началась перед запуском Shutdown
-      //сбрасываем redisKeyShutdown на всякий случай, если предыдущий запуск не дошел до конца
+      //redisKeyShutdown is not a simple counter, so it doesn't get decremented by a build that started before Shutdown started
+      //reset redisKeyShutdown just in case the previous run didn't finish
       yield editorData.cleanupShutdown(redisKeyShutdown);
 
       var pubsub = new pubsubService();
       yield pubsub.initPromise();
       //inner ping to update presence
-      logger.debug('shutdown pubsub shutdown message');
-      pubsub.publish(JSON.stringify({type: commonDefines.c_oPublishType.shutdown, status: status}));
+      ctx.logger.debug('shutdown pubsub shutdown message');
+      yield pubsub.publish(JSON.stringify({type: commonDefines.c_oPublishType.shutdown, ctx: ctx, status: status}));
       //wait while pubsub deliver and start conversion
-      logger.debug('shutdown start wait pubsub deliver');
+      ctx.logger.debug('shutdown start wait pubsub deliver');
       var startTime = new Date().getTime();
       var isStartWait = true;
       while (true) {
         var curTime = new Date().getTime() - startTime;
         if (isStartWait && curTime >= WAIT_TIMEOUT) {
           isStartWait = false;
-          logger.debug('shutdown stop wait pubsub deliver');
+          ctx.logger.debug('shutdown stop wait pubsub deliver');
         } else if (curTime >= EXEC_TIMEOUT) {
           res = false;
-          logger.debug('shutdown timeout');
+          ctx.logger.debug('shutdown timeout');
           break;
         }
         var remainingFiles = yield editorData.getShutdownCount(redisKeyShutdown);
-        logger.debug('shutdown remaining files:%d', remainingFiles);
+        ctx.logger.debug('shutdown remaining files:%d', remainingFiles);
         if (!isStartWait && remainingFiles <= 0) {
           break;
         }
         yield utils.sleep(LOOP_TIMEOUT);
       }
-      //todo надо проверять очереди, потому что могут быть долгие конвертации запущенные до Shutdown
+      //todo need to check the queues, because there may be long conversions running before Shutdown
       //clean up
       yield editorData.cleanupShutdown(redisKeyShutdown);
       yield pubsub.close();
 
-      logger.debug('shutdown end');
+      ctx.logger.debug('shutdown end');
     } catch (e) {
       res = false;
-      logger.error('shutdown error:\r\n%s', e.stack);
+      ctx.logger.error('shutdown error: %s', e.stack);
     }
     return res;
   });

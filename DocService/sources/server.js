@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2019
+ * (c) Copyright Ascensio System SIA 2010-2023
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -12,7 +12,7 @@
  * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR  PURPOSE. For
  * details, see the GNU AGPL at: http://www.gnu.org/licenses/agpl-3.0.html
  *
- * You can contact Ascensio System SIA at 20A-12 Ernesta Birznieka-Upisha
+ * You can contact Ascensio System SIA at 20A-6 Ernesta Birznieka-Upish
  * street, Riga, Latvia, EU, LV-1050.
  *
  * The  interactive user interfaces in modified source and object code versions
@@ -32,9 +32,8 @@
 
 'use strict';
 
-const configCommon = require('config');
-const config = configCommon.get('services.CoAuthoring');
-//process.env.NODE_ENV = config.get('server.mode');
+const config = require('config');
+//process.env.NODE_ENV = config.get('services.CoAuthoring.server.mode');
 const logger = require('./../../Common/sources/logger');
 const co = require('co');
 const license = require('./../../Common/sources/license');
@@ -56,15 +55,20 @@ const wopiClient = require('./wopiClient');
 const constants = require('./../../Common/sources/constants');
 const utils = require('./../../Common/sources/utils');
 const commonDefines = require('./../../Common/sources/commondefines');
-const configStorage = configCommon.get('storage');
+const operationContext = require('./../../Common/sources/operationContext');
+const tenantManager = require('./../../Common/sources/tenantManager');
+const configStorage = config.get('storage');
 
-const cfgWopiEnable = configCommon.get('wopi.enable');
-const cfgHtmlTemplate = configCommon.get('wopi.htmlTemplate');
-const cfgTokenEnableBrowser = configCommon.get('services.CoAuthoring.token.enable.browser');
-const cfgTokenEnableRequestInbox = configCommon.get('services.CoAuthoring.token.enable.request.inbox');
-const cfgTokenEnableRequestOutbox = configCommon.get('services.CoAuthoring.token.enable.request.outbox');
+const cfgWopiEnable = config.get('wopi.enable');
+const cfgHtmlTemplate = config.get('wopi.htmlTemplate');
+const cfgTokenEnableBrowser = config.get('services.CoAuthoring.token.enable.browser');
+const cfgTokenEnableRequestInbox = config.get('services.CoAuthoring.token.enable.request.inbox');
+const cfgTokenEnableRequestOutbox = config.get('services.CoAuthoring.token.enable.request.outbox');
+const cfgLicenseFile = config.get('license.license_file');
+const cfgDownloadMaxBytes = config.get('FileConverter.converter.maxDownloadBytes');
 
 const app = express();
+app.disable('x-powered-by');
 //path.resolve uses __dirname by default(unexpected path in pkg)
 app.set("views", path.resolve(process.cwd(), cfgHtmlTemplate));
 app.set("view engine", "ejs");
@@ -73,43 +77,47 @@ const server = http.createServer(app);
 let licenseInfo, licenseOriginal, updatePluginsTime, userPlugins, pluginsLoaded;
 
 const updatePlugins = (eventType, filename) => {
-	console.log('update Folder: %s ; %s', eventType, filename);
+	operationContext.global.logger.info('update Folder: %s ; %s', eventType, filename);
 	if (updatePluginsTime && 1000 >= (new Date() - updatePluginsTime)) {
 		return;
 	}
-	console.log('update Folder true: %s ; %s', eventType, filename);
+	operationContext.global.logger.info('update Folder true: %s ; %s', eventType, filename);
 	updatePluginsTime = new Date();
 	pluginsLoaded = false;
 };
 const readLicense = function*() {
-	[licenseInfo, licenseOriginal] = yield* license.readLicense();
+	[licenseInfo, licenseOriginal] = yield* license.readLicense(cfgLicenseFile);
 };
 const updateLicense = () => {
 	return co(function*() {
 		try {
 			yield* readLicense();
 			docsCoServer.setLicenseInfo(licenseInfo, licenseOriginal);
-			console.log('End updateLicense');
+			operationContext.global.logger.info('End updateLicense');
 		} catch (err) {
-			logger.error('updateLicense error:\r\n%s', err.stack);
+			operationContext.global.logger.error('updateLicense error: %s', err.stack);
 		}
 	});
 };
 
-logger.warn('Express server starting...');
+operationContext.global.logger.warn('Express server starting...');
 
 if (!(cfgTokenEnableBrowser && cfgTokenEnableRequestInbox && cfgTokenEnableRequestOutbox)) {
-	logger.warn('Set services.CoAuthoring.token.enable.browser, services.CoAuthoring.token.enable.request.inbox, ' +
+	operationContext.global.logger.warn('Set services.CoAuthoring.token.enable.browser, services.CoAuthoring.token.enable.request.inbox, ' +
 				'services.CoAuthoring.token.enable.request.outbox in the Document Server config ' +
-				'to prevent an unauthorized access to your documents and the substitution of important parameters in ONLYOFFICE Document Server requests.');
+				'to prevent an unauthorized access to your documents and the substitution of important parameters in Document Server requests.');
 }
 
 updateLicense();
+fs.watchFile(cfgLicenseFile, updateLicense);
+setInterval(updateLicense, 86400000);
 
-if (config.has('server.static_content')) {
-	const staticContent = config.get('server.static_content');
+if (config.has('services.CoAuthoring.server.static_content')) {
+	const staticContent = config.get('services.CoAuthoring.server.static_content');
 	for (let i in staticContent) {
-		app.use(i, express.static(staticContent[i]['path'], staticContent[i]['options']));
+		if (staticContent.hasOwnProperty(i)) {
+			app.use(i, express.static(staticContent[i]['path'], staticContent[i]['options']));
+		}
 	}
 }
 
@@ -118,7 +126,7 @@ if (configStorage.has('fs.folderPath')) {
 	const cfgStorageFolderName = configStorage.get('storageFolderName');
 	app.use('/' + cfgBucketName + '/' + cfgStorageFolderName, (req, res, next) => {
 		const index = req.url.lastIndexOf('/');
-		if ('GET' === req.method && -1 != index) {
+		if ('GET' === req.method && index > 0) {
 			let sendFileOptions = {
 				root: configStorage.get('fs.folderPath'), dotfiles: 'deny', headers: {
 					'Content-Disposition': 'attachment'
@@ -129,52 +137,62 @@ if (configStorage.has('fs.folderPath')) {
 				const filename = decodeURIComponent(path.basename(urlParsed.pathname));
 				sendFileOptions.headers['Content-Type'] = mime.getType(filename);
 			}
-			const realUrl = req.url.substring(0, index);
+			const realUrl = decodeURI(req.url.substring(0, index));
 			res.sendFile(realUrl, sendFileOptions, (err) => {
 				if (err) {
-					logger.error(err);
+					operationContext.global.logger.error(err);
 					res.status(400).end();
 				}
 			});
 		} else {
-			res.sendStatus(404)
+			res.sendStatus(404);
 		}
 	});
 }
 
 try {
-	fs.watch(config.get('plugins.path'), updatePlugins);
+	fs.watch(config.get('services.CoAuthoring.plugins.path'), updatePlugins);
 } catch (e) {
-	logger.warn('Failed to subscribe to plugin folder updates. When changing the list of plugins, you must restart the server. https://nodejs.org/docs/latest/api/fs.html#fs_availability');
+	operationContext.global.logger.warn('Failed to subscribe to plugin folder updates. When changing the list of plugins, you must restart the server. https://nodejs.org/docs/latest/api/fs.html#fs_availability');
 }
-fs.watchFile(configCommon.get('license').get('license_file'), updateLicense);
-setInterval(updateLicense, 86400000);
 
-// Если захочется использовать 'development' и 'production',
-// то с помощью app.settings.env (https://github.com/strongloop/express/issues/936)
-// Если нужна обработка ошибок, то теперь она такая https://github.com/expressjs/errorhandler
+// If you want to use 'development' and 'production',
+// then with app.settings.env (https://github.com/strongloop/express/issues/936)
+// If error handling is needed, now it's like this https://github.com/expressjs/errorhandler
 docsCoServer.install(server, () => {
-	console.log('Start callbackFunction');
+	operationContext.global.logger.info('Start callbackFunction');
 
-	server.listen(config.get('server.port'), () => {
-		logger.warn("Express server listening on port %d in %s mode. Version: %s. Build: %s", config.get('server.port'), app.settings.env, commonDefines.buildVersion, commonDefines.buildNumber);
+	server.listen(config.get('services.CoAuthoring.server.port'), () => {
+		operationContext.global.logger.warn("Express server listening on port %d in %s mode. Version: %s. Build: %s", config.get('services.CoAuthoring.server.port'), app.settings.env, commonDefines.buildVersion, commonDefines.buildNumber);
 	});
 
 	app.get('/index.html', (req, res) => {
-		let buildVersion = commonDefines.buildVersion;
-		let buildNumber = commonDefines.buildNumber;
-		let buildDate, packageType, customerId = "";
-		if (licenseInfo) {
-			buildDate = licenseInfo.buildDate.toISOString();
-			packageType = licenseInfo.packageType;
-			customerId = licenseInfo.customerId;
-		}
-		let output = `Server is functioning normally. Version: ${buildVersion}. Build: ${buildNumber}`;
-		output += `. Release date: ${buildDate}. Package type: ${packageType}. Customer Id: ${customerId}`;
-		res.send(output);
+		return co(function*() {
+			let ctx = new operationContext.Context();
+			try {
+				ctx.initFromRequest(req);
+				yield ctx.initTenantCache();
+				let licenseInfo = yield tenantManager.getTenantLicense(ctx);
+				let buildVersion = commonDefines.buildVersion;
+				let buildNumber = commonDefines.buildNumber;
+				let buildDate, packageType, customerId = "", alias = "";
+				if (licenseInfo) {
+					buildDate = licenseInfo.buildDate.toISOString();
+					packageType = licenseInfo.packageType;
+					customerId = licenseInfo.customerId;
+					alias = licenseInfo.alias;
+				}
+				let output = `Server is functioning normally. Version: ${buildVersion}. Build: ${buildNumber}`;
+				output += `. Release date: ${buildDate}. Package type: ${packageType}. Customer Id: ${customerId}. Alias: ${alias}`;
+				res.send(output);
+			} catch (err) {
+				ctx.logger.error('index.html error: %s', err.stack);
+				res.sendStatus(400);
+			}
+		});
 	});
 	const rawFileParser = bodyParser.raw(
-		{inflate: true, limit: config.get('server.limits_tempfile_upload'), type: function() {return true;}});
+		{inflate: true, limit: config.get('services.CoAuthoring.server.limits_tempfile_upload'), type: function() {return true;}});
 	const urleEcodedParser = bodyParser.urlencoded({ extended: false });
 	let forms = multer();
 
@@ -204,8 +222,9 @@ docsCoServer.install(server, () => {
 			res.sendStatus(403);
 		}
 	});
-	app.post('/uploadold/:docid/:userid/:index', fileUploaderService.uploadImageFileOld);
-	app.post('/upload/:docid/:userid/:index', rawFileParser, fileUploaderService.uploadImageFile);
+	//'*' for backward compatible
+	app.post('/uploadold/:docid*', fileUploaderService.uploadImageFileOld);
+	app.post('/upload/:docid*', rawFileParser, fileUploaderService.uploadImageFile);
 
 	app.post('/downloadas/:docid', rawFileParser, canvasService.downloadAs);
 	app.post('/savefile/:docid', rawFileParser, canvasService.saveFile);
@@ -214,7 +233,15 @@ docsCoServer.install(server, () => {
 	app.get('/healthcheck', utils.checkClientIp, docsCoServer.healthCheck);
 
 	app.get('/baseurl', (req, res) => {
-		res.send(utils.getBaseUrlByRequest(req));
+		let ctx = new operationContext.Context();
+		try {
+			ctx.initFromRequest(req);
+			//todo
+			// yield ctx.initTenantCache();
+			res.send(utils.getBaseUrlByRequest(ctx, req));
+		} catch (err) {
+			ctx.logger.error('baseurl error: %s', err.stack);
+		}
 	});
 
 	app.get('/robots.txt', (req, res) => {
@@ -229,14 +256,38 @@ docsCoServer.install(server, () => {
 	app.put('/internal/cluster/inactive', utils.checkClientIp, docsCoServer.shutdown);
 	app.delete('/internal/cluster/inactive', utils.checkClientIp, docsCoServer.shutdown);
 
-	if (cfgWopiEnable) {
-		app.get('/hosting/discovery', utils.checkClientIp, wopiClient.discovery);
-		app.get('/hosting/capabilities', utils.checkClientIp, wopiClient.collaboraCapabilities);
-		app.post('/hosting/wopi/:documentType/:mode', utils.checkClientIp, urleEcodedParser, forms.none(), utils.lowercaseQueryString, wopiClient.getEditorHtml);
+	function checkWopiEnable(req, res, next) {
+		//todo may be move code into wopiClient or wopiClient.discovery...
+		let ctx = new operationContext.Context();
+		ctx.initFromRequest(req);
+		ctx.initTenantCache()
+			.then(() => {
+				const tenWopiEnable = ctx.getCfg('wopi.enable', cfgWopiEnable);
+				if (tenWopiEnable) {
+					next();
+				} else {
+					res.sendStatus(404);
+				}
+			}).catch((err) => {
+				ctx.logger.error('checkWopiEnable error: %s', err.stack);
+				res.sendStatus(404);
+			});
 	}
+	//todo dest
+	let fileForms = multer({limits: {fieldSize: cfgDownloadMaxBytes}});
+	app.get('/hosting/discovery', checkWopiEnable, utils.checkClientIp, wopiClient.discovery);
+	app.get('/hosting/capabilities', checkWopiEnable, utils.checkClientIp, wopiClient.collaboraCapabilities);
+	app.post('/lool/convert-to/:format?', checkWopiEnable, utils.checkClientIp, urleEcodedParser, fileForms.single('data'), converterService.convertTo);
+	app.post('/cool/convert-to/:format?', checkWopiEnable, utils.checkClientIp, urleEcodedParser, fileForms.single('data'), converterService.convertTo);
+	app.post('/hosting/wopi/:documentType/:mode', checkWopiEnable, urleEcodedParser, forms.none(), utils.lowercaseQueryString, wopiClient.getEditorHtml);
+	app.post('/hosting/wopi/convert-and-edit/:ext/:targetext', checkWopiEnable, urleEcodedParser, forms.none(), utils.lowercaseQueryString, wopiClient.getConverterHtml);
+	app.get('/hosting/wopi/convert-and-edit-handler', checkWopiEnable, utils.lowercaseQueryString, converterService.getConverterHtmlHandler);
 
 	app.post('/dummyCallback', utils.checkClientIp, rawFileParser, function(req, res){
-		logger.debug(`dummyCallback req.body:%s`, req.body);
+		let ctx = new operationContext.Context();
+		ctx.initFromRequest(req);
+		//yield ctx.initTenantCache();//no need
+		ctx.logger.debug(`dummyCallback req.body:%s`, req.body);
 		utils.fillResponseSimple(res, JSON.stringify({error: 0}, "application/json"));
 	});
 
@@ -251,15 +302,15 @@ docsCoServer.install(server, () => {
 			return;
 		}
 
-		if (!config.has('server.static_content') || !config.has('plugins.uri')) {
+		if (!config.has('services.CoAuthoring.server.static_content') || !config.has('services.CoAuthoring.plugins.uri')) {
 			res.sendStatus(404);
 			return;
 		}
 
-		let staticContent = config.get('server.static_content');
-		let pluginsUri = config.get('plugins.uri');
+		let staticContent = config.get('services.CoAuthoring.server.static_content');
+		let pluginsUri = config.get('services.CoAuthoring.plugins.uri');
 		let pluginsPath = undefined;
-		let pluginsAutostart = config.get('plugins.autostart');
+		let pluginsAutostart = config.get('services.CoAuthoring.plugins.autostart');
 
 		if (staticContent[pluginsUri]) {
 			pluginsPath = staticContent[pluginsUri].path;
@@ -291,32 +342,40 @@ docsCoServer.install(server, () => {
 	app.get('/themes.json', apicache.middleware("5 minutes"), (req, res) => {
 		return co(function*() {
 			let themes = [];
+			let ctx = new operationContext.Context();
 			try {
-				logger.info('themes.json start');
-				if (!config.has('server.static_content') || !config.has('themes.uri')) {
+				ctx.initFromRequest(req);
+				yield ctx.initTenantCache();
+				ctx.logger.info('themes.json start');
+				if (!config.has('services.CoAuthoring.server.static_content') || !config.has('services.CoAuthoring.themes.uri')) {
 					return;
 				}
-				let staticContent = config.get('server.static_content');
-				let themesUri = config.get('themes.uri');
+				let staticContent = config.get('services.CoAuthoring.server.static_content');
+				let themesUri = config.get('services.CoAuthoring.themes.uri');
 				let themesList = [];
 
 				for (let i in staticContent) {
 					if (staticContent.hasOwnProperty(i) && themesUri.startsWith(i)) {
 						let dir = staticContent[i].path + themesUri.substring(i.length);
 						themesList = yield utils.listObjects(dir, true);
-						logger.debug('themes.json dir:%s', dir);
-						logger.debug('themes.json themesList:%j', themesList);
+						ctx.logger.debug('themes.json dir:%s', dir);
+						ctx.logger.debug('themes.json themesList:%j', themesList);
 						for (let j = 0; j < themesList.length; ++j) {
 							if (themesList[j].endsWith('.json')) {
-								let data = yield utils.readFile(themesList[j], true);
-								themes.push(JSON.parse(data.toString('utf-8')));
+								try {
+									let data = yield utils.readFile(themesList[j], true);
+									let text = new TextDecoder('utf-8', {ignoreBOM: false}).decode(data);
+									themes.push(JSON.parse(text));
+								} catch (err) {
+									ctx.logger.error('themes.json file:%s error:%s', themesList[j], err.stack);
+								}
 							}
 						}
 						break;
 					}
 				}
 			} catch (err) {
-				logger.error('themes.json error:%s', err.stack);
+				ctx.logger.error('themes.json error:%s', err.stack);
 			} finally {
 				if (themes.length > 0) {
 					res.setHeader('Content-Type', 'application/json');
@@ -324,15 +383,15 @@ docsCoServer.install(server, () => {
 				} else {
 					res.sendStatus(404);
 				}
-				logger.info('themes.json end');
+				ctx.logger.info('themes.json end');
 			}
 		});
 	});
 });
 
 process.on('uncaughtException', (err) => {
-	logger.error((new Date).toUTCString() + ' uncaughtException:', err.message);
-	logger.error(err.stack);
+	operationContext.global.logger.error((new Date).toUTCString() + ' uncaughtException:', err.message);
+	operationContext.global.logger.error(err.stack);
 	logger.shutdown(() => {
 		process.exit(1);
 	});

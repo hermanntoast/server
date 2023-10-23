@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2019
+ * (c) Copyright Ascensio System SIA 2010-2023
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -12,7 +12,7 @@
  * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR  PURPOSE. For
  * details, see the GNU AGPL at: http://www.gnu.org/licenses/agpl-3.0.html
  *
- * You can contact Ascensio System SIA at 20A-12 Ernesta Birznieka-Upisha
+ * You can contact Ascensio System SIA at 20A-6 Ernesta Birznieka-Upish
  * street, Riga, Latvia, EU, LV-1050.
  *
  * The  interactive user interfaces in modified source and object code versions
@@ -32,8 +32,7 @@
 
 'use strict';
 
-const configCommon = require('config');
-var config = configCommon.get('services.CoAuthoring');
+const config = require('config');
 var co = require('co');
 var cron = require('cron');
 var ms = require('ms');
@@ -46,14 +45,14 @@ var logger = require('./../../Common/sources/logger');
 var constants = require('./../../Common/sources/constants');
 var commondefines = require('./../../Common/sources/commondefines');
 var queueService = require('./../../Common/sources/taskqueueRabbitMQ');
+var operationContext = require('./../../Common/sources/operationContext');
 var pubsubService = require('./pubsubRabbitMQ');
 
-var cfgExpFilesCron = config.get('expire.filesCron');
-var cfgExpDocumentsCron = config.get('expire.documentsCron');
-var cfgExpFiles = config.get('expire.files');
-var cfgExpFilesRemovedAtOnce = config.get('expire.filesremovedatonce');
-var cfgForceSaveEnable = config.get('autoAssembly.enable');
-var cfgForceSaveStep = ms(config.get('autoAssembly.step'));
+var cfgExpFilesCron = config.get('services.CoAuthoring.expire.filesCron');
+var cfgExpDocumentsCron = config.get('services.CoAuthoring.expire.documentsCron');
+var cfgExpFiles = config.get('services.CoAuthoring.expire.files');
+var cfgExpFilesRemovedAtOnce = config.get('services.CoAuthoring.expire.filesremovedatonce');
+var cfgForceSaveStep = ms(config.get('services.CoAuthoring.autoAssembly.step'));
 
 function getCronStep(cronTime){
   let cronJob = new cron.CronJob(cronTime, function(){});
@@ -65,31 +64,37 @@ let expDocumentsStep = getCronStep(cfgExpDocumentsCron);
 
 var checkFileExpire = function() {
   return co(function* () {
+    let ctx = new operationContext.Context();
     try {
-      logger.debug('checkFileExpire start');
+      ctx.logger.info('checkFileExpire start');
+      let removedCount = 0;
       var expired;
-      var removedCount = 0;
       var currentRemovedCount;
       do {
         currentRemovedCount = 0;
-        expired = yield taskResult.getExpired(cfgExpFilesRemovedAtOnce, cfgExpFiles);
+        expired = yield taskResult.getExpired(ctx, cfgExpFilesRemovedAtOnce, cfgExpFiles);
         for (var i = 0; i < expired.length; ++i) {
-          var docId = expired[i].id;
-          //проверяем что никто не сидит в документе
-          let editorsCount = yield docsCoServer.getEditorsCountPromise(docId);
+          let tenant = expired[i].tenant;
+          let docId = expired[i].id;
+          ctx.init(tenant, docId, ctx.userId);
+          yield ctx.initTenantCache();
+          //todo tenant
+          //check that no one is in the document
+          let editorsCount = yield docsCoServer.getEditorsCountPromise(ctx, docId);
           if(0 === editorsCount){
-            if (yield canvasService.cleanupCache(docId)) {
+            if (yield canvasService.cleanupCache(ctx, docId)) {
               currentRemovedCount++;
             }
           } else {
-            logger.debug('checkFileExpire expire but presence: editorsCount = %d; docId = %s', editorsCount, docId);
+            ctx.logger.debug('checkFileExpire expire but presence: editorsCount = %d', editorsCount);
           }
         }
         removedCount += currentRemovedCount;
       } while (currentRemovedCount > 0);
-      logger.debug('checkFileExpire end: removedCount = %d', removedCount);
+      ctx.initDefault();
+      ctx.logger.info('checkFileExpire end: removedCount = %d', removedCount);
     } catch (e) {
-      logger.error('checkFileExpire error:\r\n%s', e.stack);
+      ctx.logger.error('checkFileExpire error: %s', e.stack);
     } finally {
       setTimeout(checkFileExpire, expFilesStep);
     }
@@ -100,8 +105,9 @@ var checkDocumentExpire = function() {
     var queue = null;
     var removedCount = 0;
     var startSaveCount = 0;
+    let ctx = new operationContext.Context();
     try {
-      logger.debug('checkDocumentExpire start');
+      ctx.logger.info('checkDocumentExpire start');
       var now = (new Date()).getTime();
       let expiredKeys = yield docsCoServer.editorData.getDocumentPresenceExpired(now);
       if (expiredKeys.length > 0) {
@@ -109,30 +115,34 @@ var checkDocumentExpire = function() {
         yield queue.initPromise(true, false, false, false, false, false);
 
         for (var i = 0; i < expiredKeys.length; ++i) {
-          var docId = expiredKeys[i];
+          let tenant = expiredKeys[i][0];
+          let docId = expiredKeys[i][1];
           if (docId) {
-            var hasChanges = yield docsCoServer.hasChanges(docId);
+            ctx.init(tenant, docId, ctx.userId);
+            yield ctx.initTenantCache();
+            var hasChanges = yield docsCoServer.hasChanges(ctx, docId);
             if (hasChanges) {
-              yield docsCoServer.createSaveTimerPromise(docId, null, null, queue, true);
+              yield docsCoServer.createSaveTimer(ctx, docId, null, null, queue, true);
               startSaveCount++;
             } else {
-              yield docsCoServer.cleanDocumentOnExitNoChangesPromise(docId);
+              yield docsCoServer.cleanDocumentOnExitNoChangesPromise(ctx, docId);
               removedCount++;
             }
           }
         }
       }
+      ctx.initDefault();
+      ctx.logger.info('checkDocumentExpire end: startSaveCount = %d, removedCount = %d', startSaveCount, removedCount);
     } catch (e) {
-      logger.error('checkDocumentExpire error:\r\n%s', e.stack);
+      ctx.logger.error('checkDocumentExpire error: %s', e.stack);
     } finally {
       try {
         if (queue) {
           yield queue.close();
         }
       } catch (e) {
-        logger.error('checkDocumentExpire error:\r\n%s', e.stack);
+        ctx.logger.error('checkDocumentExpire error: %s', e.stack);
       }
-      logger.debug('checkDocumentExpire end: startSaveCount = %d, removedCount = %d', startSaveCount, removedCount);
       setTimeout(checkDocumentExpire, expDocumentsStep);
     }
   });
@@ -141,8 +151,9 @@ let forceSaveTimeout = function() {
   return co(function* () {
     let queue = null;
     let pubsub = null;
+    let ctx = new operationContext.Context();
     try {
-      logger.debug('forceSaveTimeout start');
+      ctx.logger.info('forceSaveTimeout start');
       let now = (new Date()).getTime();
       let expiredKeys = yield docsCoServer.editorData.getForceSaveTimer(now);
       if (expiredKeys.length > 0) {
@@ -154,18 +165,23 @@ let forceSaveTimeout = function() {
 
         let actions = [];
         for (let i = 0; i < expiredKeys.length; ++i) {
-          let docId = expiredKeys[i];
+          let tenant = expiredKeys[i][0];
+          let docId = expiredKeys[i][1];
           if (docId) {
-            actions.push(docsCoServer.startForceSave(docId, commondefines.c_oAscForceSaveTypes.Timeout,
-                                                            undefined, undefined, undefined, undefined, undefined, undefined, queue, pubsub));
+            ctx.init(tenant, docId, ctx.userId);
+            yield ctx.initTenantCache();
+            actions.push(docsCoServer.startForceSave(ctx, docId, commondefines.c_oAscForceSaveTypes.Timeout,
+              undefined, undefined, undefined, undefined,
+              undefined, undefined, undefined, undefined, queue, pubsub));
           }
         }
         yield Promise.all(actions);
-        logger.debug('forceSaveTimeout actions.length %d', actions.length);
+        ctx.logger.debug('forceSaveTimeout actions.length %d', actions.length);
       }
-      logger.debug('forceSaveTimeout end');
+      ctx.initDefault();
+      ctx.logger.info('forceSaveTimeout end');
     } catch (e) {
-      logger.error('forceSaveTimeout error:\r\n%s', e.stack);
+      ctx.logger.error('forceSaveTimeout error: %s', e.stack);
     } finally {
       try {
         if (queue) {
@@ -175,7 +191,7 @@ let forceSaveTimeout = function() {
           yield pubsub.close();
         }
       } catch (e) {
-        logger.error('checkDocumentExpire error:\r\n%s', e.stack);
+        ctx.logger.error('checkDocumentExpire error: %s', e.stack);
       }
       setTimeout(forceSaveTimeout, cfgForceSaveStep);
     }
@@ -185,8 +201,6 @@ let forceSaveTimeout = function() {
 exports.startGC = function() {
   setTimeout(checkDocumentExpire, expDocumentsStep);
   setTimeout(checkFileExpire, expFilesStep);
-  if (cfgForceSaveEnable) {
-    setTimeout(forceSaveTimeout, cfgForceSaveStep);
-  }
+  setTimeout(forceSaveTimeout, cfgForceSaveStep);
 };
 exports.getCronStep = getCronStep;

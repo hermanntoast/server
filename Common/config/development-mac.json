@@ -7,6 +7,9 @@
       "folderPath": "../App_Data"
     }
   },
+  "wopi": {
+    "enable": true
+  },
   "services": {
     "CoAuthoring": {
       "server": {
@@ -26,6 +29,9 @@
           },
           "/dictionaries": {
             "path": "../../dictionaries"
+          },
+          "/welcome": {
+            "path": "../branding/welcome"
           },
           "/info": {
             "path": "../branding/info"
@@ -47,6 +53,12 @@
       },
       "sockjs": {
         "sockjs_url": "/web-apps/vendor/sockjs/sockjs.min.js"
+      },
+      "socketio": {
+        "connection": {
+          "pingTimeout": 86400000,
+          "pingInterval": 86400000
+        }
       }
     }
   },
@@ -61,8 +73,6 @@
       "presentationThemesDir": "../../sdkjs/slide/themes",
       "x2tPath": "../FileConverter/bin/x2t",
       "docbuilderPath": "../FileConverter/Bin/docbuilder",
-      "docbuilderAllFontsPath": "../App_Data/docbuilder/AllFonts.js",
-      "docbuilderCoreFontsPath": "../../core-fonts",
       "errorfiles": "error"
     }
   },
