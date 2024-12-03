@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2023
+ * (c) Copyright Ascensio System SIA 2010-2024
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -35,7 +35,6 @@
 const path = require('path');
 var config = require('config');
 var co = require('co');
-const locale = require('windows-locale');
 const mime = require('mime');
 var taskResult = require('./taskresult');
 var utils = require('./../../Common/sources/utils');
@@ -49,7 +48,8 @@ var formatChecker = require('./../../Common/sources/formatchecker');
 var statsDClient = require('./../../Common/sources/statsdclient');
 var storageBase = require('./../../Common/sources/storage-base');
 var operationContext = require('./../../Common/sources/operationContext');
-const sqlBase = require('./baseConnector');
+const sqlBase = require('./databaseConnectors/baseConnector');
+const utilsDocService = require("./utilsDocService");
 
 const cfgTokenEnableBrowser = config.get('services.CoAuthoring.token.enable.browser');
 
@@ -83,12 +83,12 @@ function* getConvertStatus(ctx, docId, encryptedUserPassword, selectRes, opt_che
         }
         break;
       case commonDefines.FileStatus.Err:
+        status.err = row.status_info;
+        break;
       case commonDefines.FileStatus.ErrToReload:
       case commonDefines.FileStatus.NeedPassword:
         status.err = row.status_info;
-        if (commonDefines.FileStatus.ErrToReload == row.status || commonDefines.FileStatus.NeedPassword == row.status) {
-          yield canvasService.cleanupCache(ctx, docId);
-        }
+        yield canvasService.cleanupErrToReload(ctx, docId);
         break;
       case commonDefines.FileStatus.NeedParams:
       case commonDefines.FileStatus.SaveVersion:
@@ -139,17 +139,16 @@ function* convertByCmd(ctx, cmd, async, opt_fileTo, opt_taskExist, opt_priority,
     task.status = commonDefines.FileStatus.WaitQueue;
     task.statusInfo = constants.NO_ERROR;
 
-    let upsertRes = yield taskResult.upsert(ctx, task);
-    //if CLIENT_FOUND_ROWS don't specify 1 row is inserted , 2 row is updated, and 0 row is set to its current values
-    //http://dev.mysql.com/doc/refman/5.7/en/insert-on-duplicate.html
-    bCreate = upsertRes.affectedRows == 1;
+    const upsertRes = yield taskResult.upsert(ctx, task);
+    bCreate = upsertRes.isInsert;
   }
   var selectRes;
   var status;
   if (!bCreate) {
     selectRes = yield taskResult.select(ctx, docId);
     status = yield* getConvertStatus(ctx, cmd.getDocId() ,cmd.getPassword(), selectRes, opt_checkPassword);
-  } else {
+  }
+  if (bCreate || (commonDefines.FileStatus.None === selectRes?.[0]?.status)) {
     var queueData = new commonDefines.TaskQueueData();
     queueData.setCtx(ctx);
     queueData.setCmd(cmd);
@@ -184,8 +183,9 @@ function* convertByCmd(ctx, cmd, async, opt_fileTo, opt_taskExist, opt_priority,
   return status;
 }
 
-async function convertFromChanges(ctx, docId, baseUrl, forceSave, externalChangeInfo, opt_userdata, opt_formdata, opt_userConnectionId,
-                                  opt_userConnectionDocId, opt_responseKey, opt_priority, opt_expiration, opt_queue, opt_redisKey) {
+async function convertFromChanges(ctx, docId, baseUrl, forceSave, externalChangeInfo, opt_userdata, opt_formdata,
+                                  opt_userConnectionId, opt_userConnectionDocId, opt_responseKey, opt_priority,
+                                  opt_expiration, opt_queue, opt_redisKey, opt_initShardKey, opt_jsonParams) {
   var cmd = new commonDefines.InputCommand();
   cmd.setCommand('sfcm');
   cmd.setDocId(docId);
@@ -195,6 +195,10 @@ async function convertFromChanges(ctx, docId, baseUrl, forceSave, externalChange
   cmd.setDelimiter(commonDefines.c_oAscCsvDelimiter.Comma);
   cmd.setForceSave(forceSave);
   cmd.setExternalChangeInfo(externalChangeInfo);
+  if (externalChangeInfo.lang) {
+    //todo lang and region are different
+    cmd.setLCID(utilsDocService.localeToLCID(externalChangeInfo.lang));
+  }
   if (opt_userdata) {
     cmd.setUserData(opt_userdata);
   }
@@ -214,8 +218,14 @@ async function convertFromChanges(ctx, docId, baseUrl, forceSave, externalChange
   if (opt_redisKey) {
     cmd.setRedisKey(opt_redisKey);
   }
+  if (opt_jsonParams) {
+    cmd.appendJsonParams(opt_jsonParams);
+  }
 
-  await canvasService.commandSfctByCmd(ctx, cmd, opt_priority, opt_expiration, opt_queue);
+  let commandSfctByCmdRes = await canvasService.commandSfctByCmd(ctx, cmd, opt_priority, opt_expiration, opt_queue, opt_initShardKey);
+  if (!commandSfctByCmdRes) {
+    return new commonDefines.ConvertStatus(constants.UNKNOWN);
+  }
   var fileTo = constants.OUTPUT_NAME;
   let outputExt = formatChecker.getStringFromFormat(cmd.getOutputFormat());
   if (outputExt) {
@@ -251,8 +261,7 @@ function convertRequest(req, res, isJson) {
       }
       let filetype = params.filetype || params.fileType || '';
       let outputtype = params.outputtype || params.outputType || '';
-      let docId = 'conv_' + params.key + '_' + outputtype;
-      ctx.setDocId(docId);
+      ctx.setDocId(params.key);
 
       if (params.key && !constants.DOC_ID_REGEX.test(params.key)) {
         ctx.logger.warn('convertRequest unexpected key = %s', params.key);
@@ -270,6 +279,19 @@ function convertRequest(req, res, isJson) {
         utils.fillResponse(req, res, new commonDefines.ConvertStatus(constants.CONVERT_PARAMS), isJson);
         return;
       }
+      if (params.pdf) {
+        if (true === params.pdf.pdfa && constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDF === outputFormat) {
+          outputFormat = constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDFA;
+        } else if (false === params.pdf.pdfa && constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDFA === outputFormat) {
+          outputFormat = constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDF;
+        }
+        if (params.pdf.form && (constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDF === outputFormat ||
+          constants.AVS_OFFICESTUDIO_FILE_CROSSPLATFORM_PDFA === outputFormat)) {
+          outputFormat = constants.AVS_OFFICESTUDIO_FILE_DOCUMENT_OFORM_PDF;
+        }
+      }
+      //todo use hash of params as id
+      let docId = 'conv_' + params.key + '_' + outputFormat;
       var cmd = new commonDefines.InputCommand();
       cmd.setCommand('conv');
       cmd.setUrl(params.url);
@@ -277,19 +299,27 @@ function convertRequest(req, res, isJson) {
       cmd.setFormat(filetype);
       cmd.setDocId(docId);
       cmd.setOutputFormat(outputFormat);
+      let outputExt = formatChecker.getStringFromFormat(cmd.getOutputFormat());
 
       cmd.setCodepage(commonDefines.c_oAscEncodingsMap[params.codePage] || commonDefines.c_oAscCodePageUtf8);
       cmd.setDelimiter(parseIntParam(params.delimiter) || commonDefines.c_oAscCsvDelimiter.Comma);
       if(undefined != params.delimiterChar)
         cmd.setDelimiterChar(params.delimiterChar);
-      if (params.region && locale[params.region.toLowerCase()]) {
-        cmd.setLCID(locale[params.region.toLowerCase()].id);
+      if (params.region) {
+        cmd.setLCID(utilsDocService.localeToLCID(params.region));
       }
+      let jsonParams = {};
       if (params.documentLayout) {
-        cmd.setJsonParams(JSON.stringify({'documentLayout': params.documentLayout}));
+        jsonParams['documentLayout'] = params.documentLayout;
       }
       if (params.spreadsheetLayout) {
-        cmd.setJsonParams(JSON.stringify({'spreadsheetLayout': params.spreadsheetLayout}));
+        jsonParams['spreadsheetLayout'] = params.spreadsheetLayout;
+      }
+      if (params.watermark) {
+        jsonParams['watermark'] = params.watermark;
+      }
+      if (Object.keys(jsonParams).length > 0) {
+        cmd.appendJsonParams(jsonParams);
       }
       if (params.password) {
         if (params.password.length > constants.PASSWORD_MAX_LENGTH) {
@@ -325,8 +355,8 @@ function convertRequest(req, res, isJson) {
             break;
         }
         cmd.setThumbnail(thumbnailData);
-        if (false == thumbnailData.getFirst()) {
-          cmd.setOutputFormat(constants.AVS_OFFICESTUDIO_FILE_IMAGE);
+        if (false === thumbnailData.getFirst() && 0 !== (constants.AVS_OFFICESTUDIO_FILE_IMAGE & cmd.getOutputFormat())) {
+          outputExt = 'zip';
         }
       }
       var documentRenderer = params.documentRenderer;
@@ -352,12 +382,14 @@ function convertRequest(req, res, isJson) {
         }
         cmd.setTextParams(textParamsData);
       }
-      let outputExt = formatChecker.getStringFromFormat(cmd.getOutputFormat());
       if (params.title) {
         cmd.setTitle(path.basename(params.title, path.extname(params.title)) + '.' + outputExt);
       }
       var async = (typeof params.async === 'string') ? 'true' == params.async : params.async;
-
+      if (async && !req.query[constants.SHARD_KEY_API_NAME] && !req.query[constants.SHARD_KEY_WOPI_NAME] && process.env.DEFAULT_SHARD_KEY) {
+        ctx.logger.warn('convertRequest set async=false. Pass query string parameter "%s" to correctly process request in sharded cluster', constants.SHARD_KEY_API_NAME);
+        async = false;
+      }
       if (constants.AVS_OFFICESTUDIO_FILE_UNKNOWN !== cmd.getOutputFormat()) {
         let fileTo = constants.OUTPUT_NAME + '.' + outputExt;
         var status = yield* convertByCmd(ctx, cmd, async, fileTo, undefined, undefined, undefined, undefined, true);
@@ -395,13 +427,7 @@ function builderRequest(req, res) {
       ctx.initFromRequest(req);
       yield ctx.initTenantCache();
       ctx.logger.info('builderRequest start');
-      let authRes;
-      if (!utils.isEmptyObject(req.query)) {
-        //todo this is a stub for compatibility. remove in future version
-        authRes = yield docsCoServer.getRequestParams(ctx, req, true);
-      } else {
-        authRes = yield docsCoServer.getRequestParams(ctx, req);
-      }
+      let authRes = yield docsCoServer.getRequestParams(ctx, req);
       let params = authRes.params;
       let docId = params.key;
       ctx.setDocId(docId);
@@ -437,6 +463,10 @@ function builderRequest(req, res) {
           yield* docsCoServer.addTask(queueData, constants.QUEUE_PRIORITY_LOW);
         }
         let async = (typeof params.async === 'string') ? 'true' === params.async : params.async;
+        if (async && !req.query[constants.SHARD_KEY_API_NAME] && !req.query[constants.SHARD_KEY_WOPI_NAME] && process.env.DEFAULT_SHARD_KEY) {
+          ctx.logger.warn('builderRequest set async=false. Pass query string parameter "%s" to correctly process request in sharded cluster', constants.SHARD_KEY_API_NAME);
+          async = false;
+        }
         let status = yield* convertByCmd(ctx, cmd, async, undefined, undefined, constants.QUEUE_PRIORITY_LOW);
         end = status.end;
         error = status.err;
@@ -469,6 +499,24 @@ function convertTo(req, res) {
       if (req.params.format) {
         format = req.params.format;
       }
+      //todo https://github.com/LibreOffice/core/blob/9d3366f5b392418dc83bc0adbe3d215cff4b3605/desktop/source/lib/init.cxx#L3478
+      let password = req.body['Password'];
+      if (password) {
+        if (password.length > constants.PASSWORD_MAX_LENGTH) {
+          ctx.logger.warn('convert-to Password too long actual = %s; max = %s', password.length, constants.PASSWORD_MAX_LENGTH);
+          res.sendStatus(400);
+          return;
+        }
+      }
+      //by analogy with Password
+      let passwordToOpen = req.body['PasswordToOpen'];
+      if (passwordToOpen) {
+        if (passwordToOpen.length > constants.PASSWORD_MAX_LENGTH) {
+          ctx.logger.warn('convert-to PasswordToOpen too long actual = %s; max = %s', passwordToOpen.length, constants.PASSWORD_MAX_LENGTH);
+          res.sendStatus(400);
+          return;
+        }
+      }
       let pdfVer = req.body['PDFVer'];
       if (pdfVer && pdfVer.startsWith("PDF/A") && 'pdf' === format) {
         format = 'pdfa';
@@ -481,13 +529,11 @@ function convertTo(req, res) {
         res.sendStatus(400);
         return;
       }
-      //todo https://github.com/CollaboraOnline/online/blob/master/wsd/COOLWSD.cpp
-      //req.body['options']
-
       let docId, fileTo, status, originalname;
-      if (req.file && req.file.originalname && req.file.buffer) {
-        originalname = req.file.originalname;
-        let filetype = path.extname(req.file.originalname).substring(1);
+      if (req.files?.length > 0 && req.files[0].originalname && req.files[0].buffer) {
+        const file = req.files[0];
+        originalname = file.originalname;
+        let filetype = path.extname(file.originalname).substring(1);
         if (filetype && !constants.EXTENTION_REGEX.test(filetype)) {
           ctx.logger.warn('convertRequest unexpected filetype = %s', filetype);
           res.sendStatus(400);
@@ -499,33 +545,40 @@ function convertTo(req, res) {
         ctx.setDocId(docId);
 
         //todo stream
-        let buffer = req.file.buffer;
+        let buffer = file.buffer;
         yield storageBase.putObject(ctx, docId + '/origin.' + filetype, buffer, buffer.length);
 
         let cmd = new commonDefines.InputCommand();
         cmd.setCommand('conv');
         cmd.setDocId(docId);
-        cmd.setSaveKey(docId);
         cmd.setFormat(filetype);
         cmd.setOutputFormat(outputFormat);
         cmd.setCodepage(commonDefines.c_oAscCodePageUtf8);
         cmd.setDelimiter(commonDefines.c_oAscCsvDelimiter.Comma);
-        if (lang && locale[lang.toLowerCase()]) {
-          cmd.setLCID(locale[lang.toLowerCase()].id);
+        if (lang) {
+          cmd.setLCID(utilsDocService.localeToLCID(lang));
         }
         if (fullSheetPreview) {
-          cmd.setJsonParams(JSON.stringify({'spreadsheetLayout': {
+          cmd.appendJsonParams({'spreadsheetLayout': {
             "ignorePrintArea": true,
             "fitToWidth": 1,
             "fitToHeight": 1
-          }}));
+          }});
         } else {
-          cmd.setJsonParams(JSON.stringify({'spreadsheetLayout': {
+          cmd.appendJsonParams({'spreadsheetLayout': {
             "ignorePrintArea": true,
             "fitToWidth": 0,
             "fitToHeight": 0,
             "scale": 100
-          }}));
+          }});
+        }
+        if (password) {
+          let encryptedPassword = yield utils.encryptPassword(ctx, password);
+          cmd.setSavePassword(encryptedPassword);
+        }
+        if (passwordToOpen) {
+          let encryptedPassword = yield utils.encryptPassword(ctx, passwordToOpen);
+          cmd.setPassword(encryptedPassword);
         }
 
         fileTo = constants.OUTPUT_NAME;
@@ -623,7 +676,7 @@ function getConverterHtmlHandler(req, res) {
       ctx.setDocId(docId);
       if (!(wopiSrc && access_token && access_token && targetext && docId) ||
         constants.AVS_OFFICESTUDIO_FILE_UNKNOWN === formatChecker.getFormatFromString(targetext)) {
-        ctx.logger.debug('convert-and-edit-handler invalid params: wopiSrc=%s; access_token=%s; targetext=%s; docId=%s', wopiSrc, access_token, targetext, docId);
+        ctx.logger.debug('convert-and-edit-handler invalid params: WOPISrc=%s; access_token=%s; targetext=%s; docId=%s', wopiSrc, access_token, targetext, docId);
         utils.fillResponse(req, res, new commonDefines.ConvertStatus(constants.CONVERT_PARAMS), isJson);
         return;
       }
@@ -647,10 +700,9 @@ function getConverterHtmlHandler(req, res) {
 
         let metadata = yield storage.headObject(ctx, fileTo);
         let streamObj = yield storage.createReadStream(ctx, fileTo);
-        let postRes = yield wopiClient.putRelativeFile(ctx, wopiSrc, access_token, null, streamObj.readStream, metadata.ContentLength, `.${targetext}`, true);
-        if (postRes) {
-          let fileInfo = JSON.parse(postRes.body);
-          status.setUrl(fileInfo.HostEditUrl);
+        let putRelativeRes = yield wopiClient.putRelativeFile(ctx, wopiSrc, access_token, null, streamObj.readStream, metadata.ContentLength, `.${targetext}`, undefined, true);
+        if (putRelativeRes) {
+          status.setUrl(putRelativeRes.HostEditUrl);
           status.setExtName('.' + targetext);
         } else {
           status.err = constants.UNKNOWN;

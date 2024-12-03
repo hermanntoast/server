@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2023
+ * (c) Copyright Ascensio System SIA 2010-2024
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -36,6 +36,7 @@ var multiparty = require('multiparty');
 var co = require('co');
 var jwt = require('jsonwebtoken');
 var taskResult = require('./taskresult');
+const utilsDocService = require('./utilsDocService');
 var docsCoServer = require('./DocsCoServer');
 var utils = require('./../../Common/sources/utils');
 var constants = require('./../../Common/sources/constants');
@@ -43,7 +44,6 @@ var storageBase = require('./../../Common/sources/storage-base');
 var formatChecker = require('./../../Common/sources/formatchecker');
 const commonDefines = require('./../../Common/sources/commondefines');
 const operationContext = require('./../../Common/sources/operationContext');
-//const sharp = require("sharp");
 var config = require('config');
 
 const cfgImageSize = config.get('services.CoAuthoring.server.limits_image_size');
@@ -252,17 +252,17 @@ exports.uploadImageFile = function(req, res) {
           var supportedFormats = tenTypesUpload || 'jpg';
           let formatLimit = formatStr && -1 !== supportedFormats.indexOf(formatStr);
           if (formatLimit) {
+            if (format === constants.AVS_OFFICESTUDIO_FILE_IMAGE_TIFF) {
+              buffer = yield utilsDocService.convertImageToPng(ctx, buffer);
+              format = constants.AVS_OFFICESTUDIO_FILE_IMAGE_PNG;
+              formatStr = formatChecker.getStringFromFormat(format);
+            }
             //a hash is written at the beginning to avoid errors during parallel upload in co-editing
             var strImageName = crypto.randomBytes(16).toString("hex");
             var strPathRel = 'media/' + strImageName + '.' + formatStr;
             var strPath = docId + '/' + strPathRel;
-            // //fix exif rotation
-            // //todo move to commons
-            // let sharpTransform = sharp(buffer);
-            // let metadata = yield sharpTransform.metadata();
-            // if (undefined !== metadata.orientation && metadata.orientation > 1) {
-            //   buffer = yield  sharpTransform.rotate().toBuffer();
-            // }
+
+            buffer = yield utilsDocService.fixImageExifRotation(ctx, buffer);
 
             yield storageBase.putObject(ctx, strPath, buffer, buffer.length);
             output[strPathRel] = yield storageBase.getSignedUrl(ctx, utils.getBaseUrlByRequest(ctx, req), strPath,

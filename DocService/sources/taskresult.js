@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2023
+ * (c) Copyright Ascensio System SIA 2010-2024
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -33,18 +33,16 @@
 'use strict';
 
 const crypto = require('crypto');
-var sqlBase = require('./baseConnector');
-var utils = require('./../../Common/sources/utils');
+var sqlBase = require('./databaseConnectors/baseConnector');
 var constants = require('./../../Common/sources/constants');
 var commonDefines = require('./../../Common/sources/commondefines');
 var tenantManager = require('./../../Common/sources/tenantManager');
 var config = require('config');
 
 const cfgTableResult = config.get('services.CoAuthoring.sql.tableResult');
-const cfgTableChanges = config.get('services.CoAuthoring.sql.tableChanges');
 
-let addSqlParam = sqlBase.baseConnector.addSqlParameter;
-let concatParams = sqlBase.baseConnector.concatParams;
+let addSqlParam = sqlBase.addSqlParameter;
+let concatParams = sqlBase.concatParams;
 
 var RANDOM_KEY_MAX = 10000;
 
@@ -97,8 +95,8 @@ TaskResultData.prototype.completeDefaults = function() {
   }
 };
 
-function upsert(ctx, task, opt_updateUserIndex) {
-  return sqlBase.baseConnector.upsert(ctx, task, opt_updateUserIndex);
+function upsert(ctx, task) {
+  return sqlBase.upsert(ctx, task);
 }
 
 function select(ctx, docId) {
@@ -107,7 +105,7 @@ function select(ctx, docId) {
     let p1 = addSqlParam(ctx.tenant, values);
     let p2 = addSqlParam(docId, values);
     let sqlCommand = `SELECT * FROM ${cfgTableResult} WHERE tenant=${p1} AND id=${p2};`;
-    sqlBase.baseConnector.sqlQuery(ctx, sqlCommand, function(error, result) {
+    sqlBase.sqlQuery(ctx, sqlCommand, function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -176,7 +174,7 @@ function update(ctx, task, setPassword) {
     let p1 = addSqlParam(task.tenant, values);
     let p2 = addSqlParam(task.key, values);
     let sqlCommand = `UPDATE ${cfgTableResult} SET ${sqlSet} WHERE tenant=${p1} AND id=${p2};`;
-    sqlBase.baseConnector.sqlQuery(ctx, sqlCommand, function(error, result) {
+    sqlBase.sqlQuery(ctx, sqlCommand, function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -196,7 +194,7 @@ function updateIf(ctx, task, mask) {
     let sqlSet = commandArg.join(', ');
     let sqlWhere = commandArgMask.join(' AND ');
     let sqlCommand = `UPDATE ${cfgTableResult} SET ${sqlSet} WHERE ${sqlWhere};`;
-    sqlBase.baseConnector.sqlQuery(ctx, sqlCommand, function(error, result) {
+    sqlBase.sqlQuery(ctx, sqlCommand, function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -247,7 +245,7 @@ function addRandomKey(ctx, task, opt_prefix, opt_size) {
     let p8 = addSqlParam(task.baseurl, values);
     let sqlCommand = `INSERT INTO ${cfgTableResult} (tenant, id, status, status_info, last_open_date, user_index, change_id, callback, baseurl)` +
       ` VALUES (${p0}, ${p1}, ${p2}, ${p3}, ${p4}, ${p5}, ${p6}, ${p7}, ${p8});`;
-    sqlBase.baseConnector.sqlQuery(ctx, sqlCommand, function(error, result) {
+    sqlBase.sqlQuery(ctx, sqlCommand, function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -288,7 +286,7 @@ function remove(ctx, docId) {
     let p1 = addSqlParam(ctx.tenant, values);
     let p2 = addSqlParam(docId, values);
     const sqlCommand = `DELETE FROM ${cfgTableResult} WHERE tenant=${p1} AND id=${p2};`;
-    sqlBase.baseConnector.sqlQuery(ctx, sqlCommand, function(error, result) {
+    sqlBase.sqlQuery(ctx, sqlCommand, function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -305,25 +303,7 @@ function removeIf(ctx, mask) {
     commandArgMask.push('id=' + addSqlParam(mask.key, values));
     let sqlWhere = commandArgMask.join(' AND ');
     const sqlCommand = `DELETE FROM ${cfgTableResult} WHERE ${sqlWhere};`;
-    sqlBase.baseConnector.sqlQuery(ctx, sqlCommand, function(error, result) {
-      if (error) {
-        reject(error);
-      } else {
-        resolve(result);
-      }
-    }, undefined, undefined, values);
-  });
-}
-function getExpired(ctx, maxCount, expireSeconds) {
-  return new Promise(function(resolve, reject) {
-    let values = [];
-    let expireDate = new Date();
-    utils.addSeconds(expireDate, -expireSeconds);
-    let sqlParam1 = addSqlParam(expireDate, values);
-    let sqlParam2 = addSqlParam(maxCount, values);
-    let sqlCommand = `SELECT * FROM ${cfgTableResult} WHERE last_open_date <= ${sqlParam1}` +
-      ` AND NOT EXISTS(SELECT tenant, id FROM ${cfgTableChanges} WHERE ${cfgTableChanges}.tenant = ${cfgTableResult}.tenant AND ${cfgTableChanges}.id = ${cfgTableResult}.id LIMIT 1) LIMIT ${sqlParam2};`;
-    sqlBase.baseConnector.sqlQuery(ctx, sqlCommand, function(error, result) {
+    sqlBase.sqlQuery(ctx, sqlCommand, function(error, result) {
       if (error) {
         reject(error);
       } else {
@@ -342,4 +322,4 @@ exports.restoreInitialPassword = restoreInitialPassword;
 exports.addRandomKeyTask = addRandomKeyTask;
 exports.remove = remove;
 exports.removeIf = removeIf;
-exports.getExpired = getExpired;
+exports.getExpired = sqlBase.getExpired;

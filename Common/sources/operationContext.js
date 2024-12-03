@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2023
+ * (c) Copyright Ascensio System SIA 2010-2024
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -41,17 +41,19 @@ function Context(){
   this.logger = logger.getLogger('nodeJS');
   this.initDefault();
 }
-Context.prototype.init = function(tenant, docId, userId) {
+Context.prototype.init = function(tenant, docId, userId, opt_shardKey, opt_WopiSrc) {
   this.setTenant(tenant);
   this.setDocId(docId);
   this.setUserId(userId);
+  this.setShardKey(opt_shardKey);
+  this.setWopiSrc(opt_WopiSrc);
 
   this.config = null;
   this.secret = null;
   this.license = null;
 };
 Context.prototype.initDefault = function() {
-  this.init(tenantManager.getDefautTenant(), constants.DEFAULT_DOC_ID, constants.DEFAULT_USER_ID);
+  this.init(tenantManager.getDefautTenant(), constants.DEFAULT_DOC_ID, constants.DEFAULT_USER_ID, undefined);
 };
 Context.prototype.initFromConnection = function(conn) {
   let tenant = tenantManager.getTenantByConnection(this, conn);
@@ -64,19 +66,23 @@ Context.prototype.initFromConnection = function(conn) {
     }
   }
   let userId = conn.user?.id;
-  this.init(tenant, docId || this.docId, userId || this.userId);
+  let shardKey = utils.getShardKeyByConnection(this, conn);
+  let wopiSrc = utils.getWopiSrcByConnection(this, conn);
+  this.init(tenant, docId || this.docId, userId || this.userId, shardKey, wopiSrc);
 };
 Context.prototype.initFromRequest = function(req) {
   let tenant = tenantManager.getTenantByRequest(this, req);
-  this.init(tenant, this.docId, this.userId);
+  let shardKey = utils.getShardKeyByRequest(this, req);
+  let wopiSrc = utils.getWopiSrcByRequest(this, req);
+  this.init(tenant, this.docId, this.userId, shardKey, wopiSrc);
 };
 Context.prototype.initFromTaskQueueData = function(task) {
   let ctx = task.getCtx();
-  this.init(ctx.tenant, ctx.docId, ctx.userId);
+  this.init(ctx.tenant, ctx.docId, ctx.userId, ctx.shardKey, ctx.wopiSrc);
 };
 Context.prototype.initFromPubSub = function(data) {
   let ctx = data.ctx;
-  this.init(ctx.tenant, ctx.docId, ctx.userId);
+  this.init(ctx.tenant, ctx.docId, ctx.userId, ctx.shardKey, ctx.wopiSrc);
 };
 Context.prototype.initTenantCache = async function() {
   this.config = await tenantManager.getTenantConfig(this);
@@ -95,11 +101,19 @@ Context.prototype.setUserId = function(userId) {
   this.userId = userId;
   this.logger.addContext('USERID', userId);
 };
+Context.prototype.setShardKey = function(shardKey) {
+  this.shardKey = shardKey;
+};
+Context.prototype.setWopiSrc = function(wopiSrc) {
+  this.wopiSrc = wopiSrc;
+};
 Context.prototype.toJSON = function() {
   return {
     tenant: this.tenant,
     docId: this.docId,
-    userId: this.userId
+    userId: this.userId,
+    shardKey: this.shardKey,
+    wopiSrc: this.wopiSrc
   }
 };
 Context.prototype.getCfg = function(property, defaultValue) {

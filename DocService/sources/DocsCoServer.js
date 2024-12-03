@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2023
+ * (c) Copyright Ascensio System SIA 2010-2024
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -87,10 +87,11 @@ const bytes = require('bytes');
 const storage = require('./../../Common/sources/storage-base');
 const constants = require('./../../Common/sources/constants');
 const utils = require('./../../Common/sources/utils');
+const utilsDocService = require('./utilsDocService');
 const commonDefines = require('./../../Common/sources/commondefines');
 const statsDClient = require('./../../Common/sources/statsdclient');
 const config = require('config');
-const sqlBase = require('./baseConnector');
+const sqlBase = require('./databaseConnectors/baseConnector');
 const canvasService = require('./canvasservice');
 const converterService = require('./converterservice');
 const taskResult = require('./taskresult');
@@ -101,8 +102,13 @@ const wopiClient = require('./wopiClient');
 const queueService = require('./../../Common/sources/taskqueueRabbitMQ');
 const operationContext = require('./../../Common/sources/operationContext');
 const tenantManager = require('./../../Common/sources/tenantManager');
+const { notificationTypes, ...notificationService } = require('../../Common/sources/notificationService');
 
-const editorDataStorage = require('./' + config.get('services.CoAuthoring.server.editorDataStorage'));
+const cfgEditorDataStorage = config.get('services.CoAuthoring.server.editorDataStorage');
+const cfgEditorStatStorage = config.get('services.CoAuthoring.server.editorStatStorage');
+const editorDataStorage = require('./' + cfgEditorDataStorage);
+const editorStatStorage = require('./' + (cfgEditorStatStorage || cfgEditorDataStorage));
+const util = require("util");
 
 const cfgEditSingleton =  config.get('services.CoAuthoring.server.edit_singleton');
 const cfgEditor =  config.get('services.CoAuthoring.editor');
@@ -132,18 +138,21 @@ const cfgForgottenFiles = config.get('services.CoAuthoring.server.forgottenfiles
 const cfgForgottenFilesName = config.get('services.CoAuthoring.server.forgottenfilesname');
 const cfgMaxRequestChanges = config.get('services.CoAuthoring.server.maxRequestChanges');
 const cfgWarningLimitPercents = config.get('license.warning_limit_percents');
+const cfgNotificationRuleLicenseLimitEdit = config.get('notification.rules.licenseLimitEdit.template');
+const cfgNotificationRuleLicenseLimitLiveViewer = config.get('notification.rules.licenseLimitLiveViewer.template');
 const cfgErrorFiles = config.get('FileConverter.converter.errorfiles');
 const cfgOpenProtectedFile = config.get('services.CoAuthoring.server.openProtectedFile');
 const cfgIsAnonymousSupport = config.get('services.CoAuthoring.server.isAnonymousSupport');
 const cfgTokenRequiredParams = config.get('services.CoAuthoring.server.tokenRequiredParams');
 const cfgImageSize = config.get('services.CoAuthoring.server.limits_image_size');
 const cfgTypesUpload = config.get('services.CoAuthoring.utils.limits_image_types_upload');
-
+const cfgForceSaveUsingButtonWithoutChanges = config.get('services.CoAuthoring.server.forceSaveUsingButtonWithoutChanges');
 //todo tenant
 const cfgExpDocumentsCron = config.get('services.CoAuthoring.expire.documentsCron');
 const cfgRefreshLockInterval = ms(config.get('wopi.refreshLockInterval'));
 const cfgSocketIoConnection = config.get('services.CoAuthoring.socketio.connection');
 const cfgTableResult = config.get('services.CoAuthoring.sql.tableResult');
+const cfgTableChanges = config.get('services.CoAuthoring.sql.tableChanges');
 
 const EditorTypes = {
   document : 0,
@@ -152,13 +161,14 @@ const EditorTypes = {
 };
 
 const defaultHttpPort = 80, defaultHttpsPort = 443;	// Default ports (for http and https)
-const editorData = new editorDataStorage();
+//todo remove editorDataStorage constructor usage after 8.1
+const editorData = editorDataStorage.EditorData ? new editorDataStorage.EditorData() : new editorDataStorage();
+const editorStat = editorStatStorage.EditorStat ? new editorStatStorage.EditorStat() : new editorDataStorage();
 const clientStatsD = statsDClient.getClient();
 let connections = []; // Active connections
 let lockDocumentsTimerId = {};//to drop connection that can't unlockDocument
 let pubsub;
 let queue;
-let f = {type: constants.LICENSE_RESULT.Error, light: false, branding: false, customization: false, plugins: false};
 let shutdownFlag = false;
 let expDocumentsStep = gc.getCronStep(cfgExpDocumentsCron);
 
@@ -435,30 +445,30 @@ function updatePresenceCounters(ctx, conn, val) {
       //yield ctx.initTenantCache(); //no need.only global config
     }
     if (utils.isLiveViewer(conn)) {
-      yield editorData.incrLiveViewerConnectionsCountByShard(ctx, SHARD_ID, val);
+      yield editorStat.incrLiveViewerConnectionsCountByShard(ctx, SHARD_ID, val);
       if (aggregationCtx) {
-        yield editorData.incrLiveViewerConnectionsCountByShard(aggregationCtx, SHARD_ID, val);
+        yield editorStat.incrLiveViewerConnectionsCountByShard(aggregationCtx, SHARD_ID, val);
       }
       if (clientStatsD) {
-        let countLiveView = yield editorData.getLiveViewerConnectionsCount(ctx, connections);
+        let countLiveView = yield editorStat.getLiveViewerConnectionsCount(ctx, connections);
         clientStatsD.gauge('expireDoc.connections.liveview', countLiveView);
       }
     } else if (conn.isCloseCoAuthoring || (conn.user && conn.user.view)) {
-      yield editorData.incrViewerConnectionsCountByShard(ctx, SHARD_ID, val);
+      yield editorStat.incrViewerConnectionsCountByShard(ctx, SHARD_ID, val);
       if (aggregationCtx) {
-        yield editorData.incrViewerConnectionsCountByShard(aggregationCtx, SHARD_ID, val);
+        yield editorStat.incrViewerConnectionsCountByShard(aggregationCtx, SHARD_ID, val);
       }
       if (clientStatsD) {
-        let countView = yield editorData.getViewerConnectionsCount(ctx, connections);
+        let countView = yield editorStat.getViewerConnectionsCount(ctx, connections);
         clientStatsD.gauge('expireDoc.connections.view', countView);
       }
     } else {
-      yield editorData.incrEditorConnectionsCountByShard(ctx, SHARD_ID, val);
+      yield editorStat.incrEditorConnectionsCountByShard(ctx, SHARD_ID, val);
       if (aggregationCtx) {
-        yield editorData.incrEditorConnectionsCountByShard(aggregationCtx, SHARD_ID, val);
+        yield editorStat.incrEditorConnectionsCountByShard(aggregationCtx, SHARD_ID, val);
       }
       if (clientStatsD) {
-        let countEditors = yield editorData.getEditorConnectionsCount(ctx, connections);
+        let countEditors = yield editorStat.getEditorConnectionsCount(ctx, connections);
         clientStatsD.gauge('expireDoc.connections.edit', countEditors);
       }
     }
@@ -472,6 +482,14 @@ function addPresence(ctx, conn, updateCunters) {
     }
   });
 }
+async function updatePresence(ctx, conn) {
+  if (editorData.updatePresence) {
+    return await editorData.updatePresence(ctx, conn.docId, conn.user.id);
+  } else {
+    //todo remove if after 7.6. code for backward compatibility, because redis in separate repo
+    return await editorData.addPresence(ctx, conn.docId, conn.user.id, utils.getConnectionInfoStr(conn));
+  }
+}
 function removePresence(ctx, conn) {
   return co(function* () {
     yield editorData.removePresence(ctx, conn.docId, conn.user.id);
@@ -481,7 +499,7 @@ function removePresence(ctx, conn) {
 
 let changeConnectionInfo = co.wrap(function*(ctx, conn, cmd) {
   if (!conn.denyChangeName && conn.user) {
-    yield* publish(ctx, {type: commonDefines.c_oPublishType.changeConnecitonInfo, ctx: ctx, docId: conn.docId, useridoriginal: conn.user.idOriginal, cmd: cmd});
+    yield publish(ctx, {type: commonDefines.c_oPublishType.changeConnecitonInfo, ctx: ctx, docId: conn.docId, useridoriginal: conn.user.idOriginal, cmd: cmd});
     return true;
   }
   return false;
@@ -519,7 +537,6 @@ function fillJwtByConnection(ctx, conn) {
       edit.coEditing = {mode: conn.coEditingMode};
     }
     //no standart
-    edit.ds_view = conn.user.view;
     edit.ds_isCloseCoAuthoring = conn.isCloseCoAuthoring;
     edit.ds_isEnterCorrectPassword = conn.isEnterCorrectPassword;
     // presenter viewer opens with same session jwt. do not put sessionId to jwt
@@ -589,6 +606,12 @@ function modifyConnectionForPassword(ctx, conn, isEnterCorrectPassword) {
     }
   });
 }
+function modifyConnectionEditorToView(ctx, conn) {
+  if (conn.user) {
+    conn.user.view = true;
+  }
+  delete conn.coEditingMode;
+}
 function getParticipants(docId, excludeClosed, excludeUserId, excludeViewer) {
   return _.filter(connections, function(el) {
     return el.docId === docId && el.isCloseCoAuthoring !== excludeClosed &&
@@ -611,11 +634,11 @@ function* updateEditUsers(ctx, licenseInfo, userId, anonym, isLiveViewer) {
       licenseInfo.usersExpire - 1;
   let period = utils.getLicensePeriod(licenseInfo.startDate, now);
   if (isLiveViewer) {
-    yield editorData.addPresenceUniqueViewUser(ctx, userId, expireAt, {anonym: anonym});
-    yield editorData.addPresenceUniqueViewUsersOfMonth(ctx, userId, period, {anonym: anonym, firstOpenDate: now.toISOString()});
+    yield editorStat.addPresenceUniqueViewUser(ctx, userId, expireAt, {anonym: anonym});
+    yield editorStat.addPresenceUniqueViewUsersOfMonth(ctx, userId, period, {anonym: anonym, firstOpenDate: now.toISOString()});
   } else {
-    yield editorData.addPresenceUniqueUser(ctx, userId, expireAt, {anonym: anonym});
-    yield editorData.addPresenceUniqueUsersOfMonth(ctx, userId, period, {anonym: anonym, firstOpenDate: now.toISOString()});
+    yield editorStat.addPresenceUniqueUser(ctx, userId, expireAt, {anonym: anonym});
+    yield editorStat.addPresenceUniqueUsersOfMonth(ctx, userId, period, {anonym: anonym, firstOpenDate: now.toISOString()});
   }
 }
 function* getEditorsCount(ctx, docId, opt_hvals) {
@@ -652,12 +675,12 @@ function* isUserReconnect(ctx, docId, userId, connectionId) {
 }
 
 let pubsubOnMessage = null;//todo move function
-function* publish(ctx, data, optDocId, optUserId, opt_pubsub) {
+async function publish(ctx, data, optDocId, optUserId, opt_pubsub) {
   var needPublish = true;
   let hvals;
   if (optDocId && optUserId) {
     needPublish = false;
-    hvals = yield editorData.getPresence(ctx, optDocId, connections);
+    hvals = await editorData.getPresence(ctx, optDocId, connections);
     for (var i = 0; i < hvals.length; ++i) {
       var elem = JSON.parse(hvals[i]);
       if (optUserId != elem.id) {
@@ -675,7 +698,7 @@ function* publish(ctx, data, optDocId, optUserId, opt_pubsub) {
       //todo send connections from getLocalConnectionCount to pubsubOnMessage
       pubsubOnMessage(msg);
     } else if(realPubsub) {
-      yield realPubsub.publish(msg);
+      await realPubsub.publish(msg);
     }
   }
   return needPublish;
@@ -696,9 +719,9 @@ function* removeResponse(data) {
   yield queue.removeResponse(data);
 }
 
-function* getOriginalParticipantsId(ctx, docId) {
+async function getOriginalParticipantsId(ctx, docId) {
   var result = [], tmpObject = {};
-  var hvals = yield editorData.getPresence(ctx, docId, connections);
+  var hvals = await editorData.getPresence(ctx, docId, connections);
   for (var i = 0; i < hvals.length; ++i) {
     var elem = JSON.parse(hvals[i]);
     if (!elem.view && !elem.isCloseCoAuthoring) {
@@ -711,13 +734,13 @@ function* getOriginalParticipantsId(ctx, docId) {
   return result;
 }
 
-function* sendServerRequest(ctx, uri, dataObject, opt_checkAndFixAuthorizationLength) {
+async function sendServerRequest(ctx, uri, dataObject, opt_checkAndFixAuthorizationLength) {
   const tenCallbackRequestTimeout = ctx.getCfg('services.CoAuthoring.server.callbackRequestTimeout', cfgCallbackRequestTimeout);
 
   ctx.logger.debug('postData request: url = %s;data = %j', uri, dataObject);
   let auth;
   if (utils.canIncludeOutboxAuthorization(ctx, uri)) {
-    let secret = yield tenantManager.getTenantSecret(ctx, commonDefines.c_oAscSecretType.Outbox);
+    let secret = await tenantManager.getTenantSecret(ctx, commonDefines.c_oAscSecretType.Outbox);
     let bodyToken = utils.fillJwtForRequest(ctx, dataObject, secret, true);
     auth = utils.fillJwtForRequest(ctx, dataObject, secret, false);
     let authLen = auth.length;
@@ -727,7 +750,8 @@ function* sendServerRequest(ctx, uri, dataObject, opt_checkAndFixAuthorizationLe
     }
     dataObject.setToken(bodyToken);
   }
-  let postRes = yield utils.postRequestPromise(ctx, uri, JSON.stringify(dataObject), undefined, undefined, tenCallbackRequestTimeout, auth);
+  let headers = {'Content-Type': 'application/json'};
+  let postRes = await utils.postRequestPromise(ctx, uri, JSON.stringify(dataObject), undefined, undefined, tenCallbackRequestTimeout, auth, headers);
   ctx.logger.debug('postData response: data = %s', postRes.body);
   return postRes.body;
 }
@@ -759,11 +783,11 @@ function parseUrl(ctx, callbackUrl) {
   return result;
 }
 
-function* getCallback(ctx, id, opt_userIndex) {
+async function getCallback(ctx, id, opt_userIndex) {
   var callbackUrl = null;
   var baseUrl = null;
   let wopiParams = null;
-  var selectRes = yield taskResult.select(ctx, id);
+  var selectRes = await taskResult.select(ctx, id);
   if (selectRes.length > 0) {
     var row = selectRes[0];
     if (row.callback) {
@@ -815,22 +839,26 @@ function* setForceSave(ctx, docId, forceSave, cmd, success, url) {
   convertInfo.setResponseKey(undefined);
   convertInfo.setFormData(undefined);
   if (convertInfo.getForceSave()) {
-    convertInfo.getForceSave().setType(undefined);
+    //type must be saved to distinguish c_oAscForceSaveTypes.Form
+    //convertInfo.getForceSave().setType(undefined);
+    convertInfo.getForceSave().setAuthorUserId(undefined);
+    convertInfo.getForceSave().setAuthorUserIndex(undefined);
   }
   yield editorData.checkAndSetForceSave(ctx, docId, forceSave.getTime(), forceSave.getIndex(), end, end, convertInfo);
 
   if (commonDefines.c_oAscForceSaveTypes.Command !== forceSaveType) {
     let data = {type: forceSaveType, time: forceSave.getTime(), success: success};
     if(commonDefines.c_oAscForceSaveTypes.Form === forceSaveType || commonDefines.c_oAscForceSaveTypes.Internal === forceSaveType) {
-      data = {code: commonDefines.c_oAscServerCommandErrors.NoError, time: null, inProgress: false};
+      let code = success ? commonDefines.c_oAscServerCommandErrors.NoError : commonDefines.c_oAscServerCommandErrors.UnknownError;
+      data = {code: code, time: null, inProgress: false};
       if (commonDefines.c_oAscForceSaveTypes.Internal === forceSaveType) {
         data.url = url;
       }
       let userId = cmd.getUserConnectionId();
       docId = cmd.getUserConnectionDocId() || docId;
-      yield* publish(ctx, {type: commonDefines.c_oPublishType.rpc, ctx, docId, userId, data, responseKey: cmd.getResponseKey()});
+      yield publish(ctx, {type: commonDefines.c_oPublishType.rpc, ctx, docId, userId, data, responseKey: cmd.getResponseKey()});
     } else {
-      yield* publish(ctx, {type: commonDefines.c_oPublishType.forceSave, ctx: ctx, docId: docId, data: data}, cmd.getUserConnectionId());
+      yield publish(ctx, {type: commonDefines.c_oPublishType.forceSave, ctx: ctx, docId: docId, data: data}, cmd.getUserConnectionId());
     }
   }
 }
@@ -839,7 +867,7 @@ async function checkForceSaveCache(ctx, convertInfo) {
   if (convertInfo) {
     res.hasCache = true;
     let cmd = new commonDefines.InputCommand(convertInfo, true);
-    const saveKey = cmd.getSaveKey();
+    const saveKey = cmd.getDocId() + cmd.getSaveKey();
     const outputPath = cmd.getOutputPath();
     if (saveKey && outputPath) {
       const savePathDoc = saveKey + '/' + outputPath;
@@ -851,7 +879,7 @@ async function checkForceSaveCache(ctx, convertInfo) {
   return res;
 }
 async function applyForceSaveCache(ctx, docId, forceSave, type, opt_userConnectionId, opt_userConnectionDocId,
-                                   opt_responseKey, opt_formdata) {
+                                   opt_responseKey, opt_formdata, opt_userId, opt_userIndex) {
   let res = {ok: false, notModified: false, inProgress: false, startedForceSave: null};
   if (!forceSave) {
     res.notModified = true;
@@ -860,7 +888,13 @@ async function applyForceSaveCache(ctx, docId, forceSave, type, opt_userConnecti
   let forceSaveCache = await checkForceSaveCache(ctx, forceSave.convertInfo);
   if (forceSaveCache.hasCache || forceSave.ended) {
     if (commonDefines.c_oAscForceSaveTypes.Form === type || commonDefines.c_oAscForceSaveTypes.Internal === type || !forceSave.ended) {
-      if (forceSaveCache.hasValidCache) {
+      //c_oAscForceSaveTypes.Form has uniqueue options {'documentLayout': {'isPrint': true}}; dont use it for other types
+      let forceSaveCached = forceSaveCache.cmd?.getForceSave()?.getType();
+      let cacheHasSameOptions = (commonDefines.c_oAscForceSaveTypes.Form === type &&
+          commonDefines.c_oAscForceSaveTypes.Form === forceSaveCached) ||
+        (commonDefines.c_oAscForceSaveTypes.Form !== type &&
+          commonDefines.c_oAscForceSaveTypes.Form !== forceSaveCached)
+      if (forceSaveCache.hasValidCache && cacheHasSameOptions) {
         let cmd = forceSaveCache.cmd;
         cmd.setUserConnectionDocId(opt_userConnectionDocId);
         cmd.setUserConnectionId(opt_userConnectionId);
@@ -868,12 +902,14 @@ async function applyForceSaveCache(ctx, docId, forceSave, type, opt_userConnecti
         cmd.setFormData(opt_formdata);
         if (cmd.getForceSave()) {
           cmd.getForceSave().setType(type);
+          cmd.getForceSave().setAuthorUserId(opt_userId);
+          cmd.getForceSave().setAuthorUserIndex(opt_userIndex);
         }
         //todo timeout because commandSfcCallback make request?
         await canvasService.commandSfcCallback(ctx, cmd, true, false);
         res.ok = true;
       } else {
-        await editorData.checkAndSetForceSave(ctx, docId, forceSave.getTime(), forceSave.getIndex(), false, false, null);
+        await editorData.checkAndSetForceSave(ctx, docId, forceSave.time, forceSave.index, false, false, null);
         res.startedForceSave = await editorData.checkAndStartForceSave(ctx, docId);
         res.ok = !!res.startedForceSave;
       }
@@ -892,7 +928,10 @@ async function applyForceSaveCache(ctx, docId, forceSave, type, opt_userConnecti
   }
   return res;
 }
-async function startForceSave(ctx, docId, type, opt_userdata, opt_formdata, opt_userId, opt_userConnectionId, opt_userConnectionDocId, opt_userIndex, opt_responseKey, opt_baseUrl, opt_queue, opt_pubsub, opt_conn) {
+async function startForceSave(ctx, docId, type, opt_userdata, opt_formdata, opt_userId, opt_userConnectionId,
+                              opt_userConnectionDocId, opt_userIndex, opt_responseKey, opt_baseUrl,
+                              opt_queue, opt_pubsub, opt_conn, opt_initShardKey, opt_jsonParams, opt_changeInfo) {
+  const tenForceSaveUsingButtonWithoutChanges = ctx.getCfg('services.CoAuthoring.server.forceSaveUsingButtonWithoutChanges', cfgForceSaveUsingButtonWithoutChanges);
   ctx.logger.debug('startForceSave start');
   let res = {code: commonDefines.c_oAscServerCommandErrors.NoError, time: null, inProgress: false};
   let startedForceSave;
@@ -904,17 +943,25 @@ async function startForceSave(ctx, docId, type, opt_userdata, opt_formdata, opt_
     });
     if (!hasEncrypted) {
       let forceSave = await editorData.getForceSave(ctx, docId);
-      if (!forceSave && commonDefines.c_oAscForceSaveTypes.Form === type && opt_conn) {
+      let forceSaveWithConnection = opt_conn && (commonDefines.c_oAscForceSaveTypes.Form === type ||
+        (commonDefines.c_oAscForceSaveTypes.Button === type && tenForceSaveUsingButtonWithoutChanges));
+      let startWithoutChanges = !forceSave && (forceSaveWithConnection || opt_changeInfo);
+      if (startWithoutChanges) {
         //stub to send forms without changes
         let newChangesLastDate = new Date();
         newChangesLastDate.setMilliseconds(0);//remove milliseconds avoid issues with MySQL datetime rounding
         let newChangesLastTime = newChangesLastDate.getTime();
-        let baseUrl = utils.getBaseUrlByConnection(ctx, opt_conn);
-        let changeInfo = getExternalChangeInfo(opt_conn.user, newChangesLastTime);
+        let baseUrl = opt_baseUrl || "";
+        let changeInfo = opt_changeInfo;
+        if (opt_conn) {
+          baseUrl = utils.getBaseUrlByConnection(ctx, opt_conn);
+          changeInfo = getExternalChangeInfo(opt_conn.user, newChangesLastTime, opt_conn.lang);
+        }
         await editorData.setForceSave(ctx, docId, newChangesLastTime, 0, baseUrl, changeInfo, null);
         forceSave = await editorData.getForceSave(ctx, docId);
       }
-      let applyCacheRes = await applyForceSaveCache(ctx, docId, forceSave, type, opt_userConnectionId, opt_userConnectionDocId, opt_responseKey, opt_formdata);
+      let applyCacheRes = await applyForceSaveCache(ctx, docId, forceSave, type, opt_userConnectionId,
+        opt_userConnectionDocId, opt_responseKey, opt_formdata, opt_userId, opt_userIndex);
       startedForceSave = applyCacheRes.startedForceSave;
       if (applyCacheRes.notModified) {
         let selectRes = await taskResult.select(ctx, docId);
@@ -938,13 +985,6 @@ async function startForceSave(ctx, docId, type, opt_userdata, opt_formdata, opt_
     forceSave.setAuthorUserId(opt_userId);
     forceSave.setAuthorUserIndex(opt_userIndex);
 
-    if (commonDefines.c_oAscForceSaveTypes.Timeout === type) {
-      await co(publish(ctx, {
-                       type: commonDefines.c_oPublishType.forceSave, ctx: ctx, docId: docId,
-                       data: {type: type, time: forceSave.getTime(), start: true}
-                     }, undefined, undefined, opt_pubsub));
-    }
-
     let priority;
     let expiration;
     if (commonDefines.c_oAscForceSaveTypes.Timeout === type) {
@@ -956,9 +996,15 @@ async function startForceSave(ctx, docId, type, opt_userdata, opt_formdata, opt_
     //start new convert
     let status = await converterService.convertFromChanges(ctx, docId, baseUrl, forceSave, startedForceSave.changeInfo,
       opt_userdata, opt_formdata, opt_userConnectionId, opt_userConnectionDocId, opt_responseKey, priority, expiration,
-      opt_queue);
+      opt_queue, undefined, opt_initShardKey, opt_jsonParams);
     if (constants.NO_ERROR === status.err) {
       res.time = forceSave.getTime();
+      if (commonDefines.c_oAscForceSaveTypes.Timeout === type) {
+        await publish(ctx, {
+          type: commonDefines.c_oPublishType.forceSave, ctx: ctx, docId: docId,
+          data: {type: type, time: forceSave.getTime(), start: true}
+        }, undefined, undefined, opt_pubsub);
+      }
     } else {
       res.code = commonDefines.c_oAscServerCommandErrors.UnknownError;
     }
@@ -967,8 +1013,8 @@ async function startForceSave(ctx, docId, type, opt_userdata, opt_formdata, opt_
   ctx.logger.debug('startForceSave end');
   return res;
 }
-function getExternalChangeInfo(user, date) {
-  return {user_id: user.id, user_id_original: user.idOriginal, user_name: user.username, change_date: date};
+function getExternalChangeInfo(user, date, lang) {
+  return {user_id: user.id, user_id_original: user.idOriginal, user_name: user.username, lang, change_date: date};
 }
 let resetForceSaveAfterChanges = co.wrap(function*(ctx, docId, newChangesLastTime, puckerIndex, baseUrl, changeInfo) {
   const tenForceSaveEnable = ctx.getCfg('services.CoAuthoring.autoAssembly.enable', cfgForceSaveEnable);
@@ -1012,9 +1058,11 @@ function* startRPC(ctx, conn, responseKey, data) {
     case 'sendForm': {
       let forceSaveRes;
       if (conn.user) {
+        //isPrint - to remove forms
+        let jsonParams = {'documentLayout': {'isPrint': true}};
         forceSaveRes = yield startForceSave(ctx, docId, commonDefines.c_oAscForceSaveTypes.Form, undefined,
           data.formdata, conn.user.idOriginal, conn.user.id, undefined, conn.user.indexUser,
-          responseKey, undefined, undefined, undefined, conn);
+          responseKey, undefined, undefined, undefined, conn, undefined, jsonParams);
       }
       if (!forceSaveRes || commonDefines.c_oAscServerCommandErrors.NoError !== forceSaveRes.code || forceSaveRes.inProgress) {
         sendDataRpc(ctx, conn, responseKey, forceSaveRes);
@@ -1096,9 +1144,9 @@ function handleDeadLetter(data, ack) {
  * @param callback
  * @param baseUrl
  */
-function* sendStatusDocument(ctx, docId, bChangeBase, opt_userAction, opt_userIndex, opt_callback, opt_baseUrl, opt_userData, opt_forceClose) {
+async function sendStatusDocument(ctx, docId, bChangeBase, opt_userAction, opt_userIndex, opt_callback, opt_baseUrl, opt_userData, opt_forceClose) {
   if (!opt_callback) {
-    var getRes = yield* getCallback(ctx, docId, opt_userIndex);
+    var getRes = await getCallback(ctx, docId, opt_userIndex);
     if (getRes) {
       opt_callback = getRes.server;
       if (!opt_baseUrl) {
@@ -1115,9 +1163,9 @@ function* sendStatusDocument(ctx, docId, bChangeBase, opt_userAction, opt_userIn
   }
 
   var status = c_oAscServerStatus.Editing;
-  var participants = yield* getOriginalParticipantsId(ctx, docId);
+  var participants = await getOriginalParticipantsId(ctx, docId);
   if (0 === participants.length) {
-    let bHasChanges = yield hasChanges(ctx, docId);
+    let bHasChanges = await hasChanges(ctx, docId);
     if (!bHasChanges || opt_forceClose) {
       status = c_oAscServerStatus.Closed;
     }
@@ -1133,7 +1181,7 @@ function* sendStatusDocument(ctx, docId, bChangeBase, opt_userAction, opt_userIn
       updateTask.key = docId;
       updateTask.callback = opt_callback.href;
       updateTask.baseurl = opt_baseUrl;
-      var updateIfRes = yield taskResult.update(ctx, updateTask);
+      var updateIfRes = await taskResult.update(ctx, updateTask);
       if (updateIfRes.affectedRows > 0) {
         ctx.logger.debug('sendStatusDocument updateIf');
       } else {
@@ -1156,13 +1204,13 @@ function* sendStatusDocument(ctx, docId, bChangeBase, opt_userAction, opt_userIn
   var uri = opt_callback.href;
   var replyData = null;
   try {
-    replyData = yield* sendServerRequest(ctx, uri, sendData);
+    replyData = await sendServerRequest(ctx, uri, sendData);
   } catch (err) {
     replyData = null;
     ctx.logger.error('postData error: url = %s;data = %j %s', uri, sendData, err.stack);
   }
-  yield* onReplySendStatusDocument(ctx, docId, replyData);
-  return opt_callback;
+  await onReplySendStatusDocument(ctx, docId, replyData);
+  return sendData;
 }
 function parseReplyData(ctx, replyData) {
   var res = null;
@@ -1176,20 +1224,20 @@ function parseReplyData(ctx, replyData) {
   }
   return res;
 }
-function* onReplySendStatusDocument(ctx, docId, replyData) {
+let onReplySendStatusDocument = co.wrap(function*(ctx, docId, replyData) {
   var oData = parseReplyData(ctx, replyData);
   if (!(oData && commonDefines.c_oAscServerCommandErrors.NoError == oData.error)) {
     // Error subscribing to callback, send warning
-    yield* publish(ctx, {type: commonDefines.c_oPublishType.warning, ctx: ctx, docId: docId, description: 'Error on save server subscription!'});
+    yield publish(ctx, {type: commonDefines.c_oPublishType.warning, ctx: ctx, docId: docId, description: 'Error on save server subscription!'});
   }
-}
+});
 function* publishCloseUsersConnection(ctx, docId, users, isOriginalId, code, description) {
   if (Array.isArray(users)) {
     let usersMap = users.reduce(function(map, val) {
       map[val] = 1;
       return map;
     }, {});
-    yield* publish(ctx, {
+    yield publish(ctx, {
                      type: commonDefines.c_oPublishType.closeConnection, ctx: ctx, docId: docId, usersMap: usersMap,
                      isOriginalId: isOriginalId, code: code, description: description
                    });
@@ -1210,7 +1258,7 @@ function closeUsersConnection(ctx, docId, usersMap, isOriginalId, code, descript
 }
 function* dropUsersFromDocument(ctx, docId, users) {
   if (Array.isArray(users)) {
-    yield* publish(ctx, {type: commonDefines.c_oPublishType.drop, ctx: ctx, docId: docId, users: users, description: ''});
+    yield publish(ctx, {type: commonDefines.c_oPublishType.drop, ctx: ctx, docId: docId, users: users, description: ''});
   }
 }
 
@@ -1242,14 +1290,14 @@ function* bindEvents(ctx, docId, callback, baseUrl, opt_userAction, opt_userData
   var bChangeBase;
   var oCallbackUrl;
   if (!callback) {
-    var getRes = yield* getCallback(ctx, docId);
+    var getRes = yield getCallback(ctx, docId);
     if (getRes && !getRes.wopiParams) {
       oCallbackUrl = getRes.server;
       bChangeBase = c_oAscChangeBase.Delete;
     }
   } else {
     oCallbackUrl = parseUrl(ctx, callback);
-    bChangeBase = c_oAscChangeBase.All;
+    bChangeBase = c_oAscChangeBase.No;
     if (null !== oCallbackUrl) {
       let filterStatus = yield* utils.checkHostFilter(ctx, oCallbackUrl.host);
       if (filterStatus > 0) {
@@ -1259,21 +1307,19 @@ function* bindEvents(ctx, docId, callback, baseUrl, opt_userAction, opt_userData
       }
     }
   }
-  if (null === oCallbackUrl) {
-    return commonDefines.c_oAscServerCommandErrors.ParseError;
-  } else {
-    yield* sendStatusDocument(ctx, docId, bChangeBase, opt_userAction, undefined, oCallbackUrl, baseUrl, opt_userData);
-    return commonDefines.c_oAscServerCommandErrors.NoError;
+  if (null !== oCallbackUrl) {
+    return yield sendStatusDocument(ctx, docId, bChangeBase, opt_userAction, undefined, oCallbackUrl, baseUrl, opt_userData);
   }
+  return null;
 }
 let unlockWopiDoc = co.wrap(function*(ctx, docId, opt_userIndex) {
   //wopi unlock
-  var getRes = yield* getCallback(ctx, docId, opt_userIndex);
+  var getRes = yield getCallback(ctx, docId, opt_userIndex);
   if (getRes && getRes.wopiParams && getRes.wopiParams.userAuth && 'view' !== getRes.wopiParams.userAuth.mode) {
-    yield wopiClient.unlock(ctx, getRes.wopiParams);
+    let unlockRes = yield wopiClient.unlock(ctx, getRes.wopiParams);
     let unlockInfo = wopiClient.getWopiUnlockMarker(getRes.wopiParams);
-    if (unlockInfo) {
-      yield canvasService.commandOpenStartPromise(ctx, docId, undefined, true, unlockInfo);
+    if (unlockInfo && unlockRes) {
+      yield canvasService.commandOpenStartPromise(ctx, docId, undefined, unlockInfo);
     }
   }
 });
@@ -1294,13 +1340,13 @@ function* cleanDocumentOnExit(ctx, docId, deleteChanges, opt_userIndex) {
 function* cleanDocumentOnExitNoChanges(ctx, docId, opt_userId, opt_userIndex, opt_forceClose) {
   var userAction = opt_userId ? new commonDefines.OutputAction(commonDefines.c_oAscUserAction.Out, opt_userId) : null;
   // We send that everyone is gone and there are no changes (to set the status on the server about the end of editing)
-  yield* sendStatusDocument(ctx, docId, c_oAscChangeBase.No, userAction, opt_userIndex, undefined, undefined, undefined, opt_forceClose);
+  yield sendStatusDocument(ctx, docId, c_oAscChangeBase.No, userAction, opt_userIndex, undefined, undefined, undefined, opt_forceClose);
   //if the user entered the document, the connection was broken, all information was deleted on the server,
   //when the connection is restored, the userIndex will be saved and it will match the userIndex of the next user
   yield* cleanDocumentOnExit(ctx, docId, false, opt_userIndex);
 }
 
-function createSaveTimer(ctx, docId, opt_userId, opt_userIndex, opt_queue, opt_noDelay) {
+function createSaveTimer(ctx, docId, opt_userId, opt_userIndex, opt_userLcid, opt_queue, opt_noDelay, opt_initShardKey) {
   return co(function*(){
     const tenAscSaveTimeOutDelay = ctx.getCfg('services.CoAuthoring.server.savetimeoutdelay', cfgAscSaveTimeOutDelay);
 
@@ -1318,7 +1364,7 @@ function createSaveTimer(ctx, docId, opt_userId, opt_userIndex, opt_queue, opt_n
       }
       while (true) {
         if (!sqlBase.isLockCriticalSection(docId)) {
-          canvasService.saveFromChanges(ctx, docId, updateTask.statusInfo, null, opt_userId, opt_userIndex, opt_queue);
+          yield canvasService.saveFromChanges(ctx, docId, updateTask.statusInfo, null, opt_userId, opt_userIndex, opt_userLcid, opt_queue, opt_initShardKey);
           break;
         }
         yield utils.sleep(c_oAscLockTimeOutDelay);
@@ -1377,10 +1423,15 @@ function getRequestParams(ctx, req, opt_isNotInBody) {
     const tenTokenEnableRequestInbox = ctx.getCfg('services.CoAuthoring.token.enable.request.inbox', cfgTokenEnableRequestInbox);
     const tenTokenRequiredParams = ctx.getCfg('services.CoAuthoring.server.tokenRequiredParams', cfgTokenRequiredParams);
 
-    let res = {code: constants.NO_ERROR, isDecoded: false, params: undefined};
-    if (req.body && Buffer.isBuffer(req.body) && req.body.length > 0 && !opt_isNotInBody) {
-      res.params = JSON.parse(req.body.toString('utf8'));
-    } else {
+    let res = {code: constants.NO_ERROR, description: "", isDecoded: false, params: undefined};
+    if (req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
+      try {
+        res.params = JSON.parse(req.body.toString('utf8'));
+      } catch(err) {
+        ctx.logger.debug('getRequestParams error parsing json body: %s', err.stack);
+      }
+    }
+    if (!res.params) {
       res.params = req.query;
     }
     if (tenTokenEnableRequestInbox) {
@@ -1408,6 +1459,7 @@ function getRequestParams(ctx, req, opt_isNotInBody) {
         } else if (constants.JWT_EXPIRED_CODE == checkJwtRes.code) {
           res.code = constants.VKEY_KEY_EXPIRE;
         }
+        res.description = checkJwtRes.description;
       }
     }
     return res;
@@ -1452,8 +1504,29 @@ function getOpenFormatByEditor(editorType) {
   return res;
 }
 
+async function isSchemaCompatible([tableName, tableSchema]) {
+  const resultSchema = await sqlBase.getTableColumns(operationContext.global, tableName);
+
+  if (resultSchema.length === 0) {
+    operationContext.global.logger.error('DB table "%s" does not exist', tableName);
+    return false;
+  }
+
+  const columnArray = resultSchema.map(row => row['column_name']);
+  const hashedResult = new Set(columnArray);
+  const schemaDiff = tableSchema.filter(column => !hashedResult.has(column));
+
+  if (schemaDiff.length > 0) {
+    operationContext.global.logger.error(`DB table "${tableName}" does not contain columns: ${schemaDiff}, columns info: ${columnArray}`);
+    return false;
+  }
+
+  return true;
+}
+
 exports.c_oAscServerStatus = c_oAscServerStatus;
 exports.editorData = editorData;
+exports.editorStat = editorStat;
 exports.sendData = sendData;
 exports.modifyConnectionForPassword = modifyConnectionForPassword;
 exports.parseUrl = parseUrl;
@@ -1481,35 +1554,32 @@ exports.getExternalChangeInfo = getExternalChangeInfo;
 exports.checkJwt = checkJwt;
 exports.getRequestParams = getRequestParams;
 exports.checkJwtHeader = checkJwtHeader;
-function encryptPasswordParams(ctx, data) {
-  return co(function*(){
-    let dataWithPassword;
-    if (data.type === 'openDocument' && data.message) {
-      dataWithPassword = data.message;
-    } else if (data.type === 'auth' && data.openCmd) {
-      dataWithPassword = data.openCmd;
-    } else if (data.c === 'savefromorigin') {
-      dataWithPassword = data;
+
+async function encryptPasswordParams(ctx, data) {
+  let dataWithPassword;
+  if (data.type === 'openDocument' && data.message) {
+    dataWithPassword = data.message;
+  } else if (data.type === 'auth' && data.openCmd) {
+    dataWithPassword = data.openCmd;
+  }
+  if (dataWithPassword && dataWithPassword.password) {
+    if (dataWithPassword.password.length > constants.PASSWORD_MAX_LENGTH) {
+      //todo send back error
+      ctx.logger.warn('encryptPasswordParams password too long actual = %s; max = %s', dataWithPassword.password.length, constants.PASSWORD_MAX_LENGTH);
+      dataWithPassword.password = null;
+    } else {
+      dataWithPassword.password = await utils.encryptPassword(ctx, dataWithPassword.password);
     }
-    if (dataWithPassword && dataWithPassword.password) {
-      if (dataWithPassword.password.length > constants.PASSWORD_MAX_LENGTH) {
-        //todo send back error
-        ctx.logger.warn('encryptPasswordParams password too long actual = %s; max = %s', dataWithPassword.password.length, constants.PASSWORD_MAX_LENGTH);
-        dataWithPassword.password = null;
-      } else {
-        dataWithPassword.password = yield utils.encryptPassword(ctx, dataWithPassword.password);
-      }
+  }
+  if (dataWithPassword && dataWithPassword.savepassword) {
+    if (dataWithPassword.savepassword.length > constants.PASSWORD_MAX_LENGTH) {
+      //todo send back error
+      ctx.logger.warn('encryptPasswordParams password too long actual = %s; max = %s', dataWithPassword.savepassword.length, constants.PASSWORD_MAX_LENGTH);
+      dataWithPassword.savepassword = null;
+    } else {
+      dataWithPassword.savepassword = await utils.encryptPassword(ctx, dataWithPassword.savepassword);
     }
-    if (dataWithPassword && dataWithPassword.savepassword) {
-      if (dataWithPassword.savepassword.length > constants.PASSWORD_MAX_LENGTH) {
-        //todo send back error
-        ctx.logger.warn('encryptPasswordParams password too long actual = %s; max = %s', dataWithPassword.savepassword.length, constants.PASSWORD_MAX_LENGTH);
-        dataWithPassword.savepassword = null;
-      } else {
-        dataWithPassword.savepassword = yield utils.encryptPassword(ctx, dataWithPassword.savepassword);
-      }
-    }
-  });
+  }
 }
 exports.encryptPasswordParams = encryptPasswordParams;
 exports.getOpenFormatByEditor = getOpenFormatByEditor;
@@ -1546,167 +1616,176 @@ exports.install = function(server, callbackFunction) {
     });
   });
 
-  io.on('connection', function(conn) {
-    if (!conn) {
-      operationContext.global.logger.error("null == conn");
-      return;
-    }
+  io.on('connection', async function(conn) {
     let ctx = new operationContext.Context();
-    ctx.initFromConnection(conn);
-    //todo
-    //yield ctx.initTenantCache();
-    if (getIsShutdown()) {
-      sendFileError(ctx, conn, 'Server shutdow');
-      return;
-    }
-    conn.baseUrl = utils.getBaseUrlByConnection(ctx, conn);
-    conn.sessionIsSendWarning = false;
-    conn.sessionTimeConnect = conn.sessionTimeLastAction = new Date().getTime();
+    try {
+      if (!conn) {
+        operationContext.global.logger.error("null == conn");
+        return;
+      }
+      ctx.initFromConnection(conn);
+      await ctx.initTenantCache();
+      if (constants.DEFAULT_DOC_ID === ctx.docId) {
+        ctx.logger.error('io.on connection unexpected key use key pattern = "%s" url = %s', constants.DOC_ID_PATTERN, conn.handshake?.url);
+        sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
+        conn.disconnect(true);
+        return;
+      }
+      if (getIsShutdown()) {
+        sendDataDisconnectReason(ctx, conn, constants.SHUTDOWN_CODE, constants.SHUTDOWN_REASON);
+        conn.disconnect(true);
+        return;
+      }
+      conn.baseUrl = utils.getBaseUrlByConnection(ctx, conn);
+      conn.sessionIsSendWarning = false;
+      conn.sessionTimeConnect = conn.sessionTimeLastAction = new Date().getTime();
 
-    conn.on('message', function(data) {
-      return co(function* () {
-      var docId = 'null';
-      let ctx = new operationContext.Context();
-      try {
-        ctx.initFromConnection(conn);
-        yield ctx.initTenantCache();
-        const tenErrorFiles = ctx.getCfg('FileConverter.converter.errorfiles', cfgErrorFiles);
+      conn.on('message', function(data) {
+        return co(function* () {
+          var docId = 'null';
+          let ctx = new operationContext.Context();
+          try {
+            ctx.initFromConnection(conn);
+            yield ctx.initTenantCache();
+            const tenErrorFiles = ctx.getCfg('FileConverter.converter.errorfiles', cfgErrorFiles);
 
-        var startDate = null;
-        if(clientStatsD) {
-          startDate = new Date();
-        }
+            var startDate = null;
+            if(clientStatsD) {
+              startDate = new Date();
+            }
 
-        docId = conn.docId;
-        ctx.logger.info('data.type = %s', data.type);
-        if(getIsShutdown())
-        {
-          ctx.logger.debug('Server shutdown receive data');
-          return;
-        }
-        if (conn.isCiriticalError && ('message' == data.type || 'getLock' == data.type || 'saveChanges' == data.type ||
-            'isSaveLock' == data.type)) {
-          ctx.logger.warn("conn.isCiriticalError send command: type = %s", data.type);
-          sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
-          conn.disconnect(true);
-          return;
-        }
-        if ((conn.isCloseCoAuthoring || (conn.user && conn.user.view)) &&
-            ('getLock' == data.type || 'saveChanges' == data.type || 'isSaveLock' == data.type)) {
-          ctx.logger.warn("conn.user.view||isCloseCoAuthoring access deny: type = %s", data.type);
-          sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
-          conn.disconnect(true);
-          return;
-        }
-        yield encryptPasswordParams(ctx, data);
-        switch (data.type) {
-          case 'auth'          :
-            try {
-              yield* auth(ctx, conn, data);
-            } catch(err){
-              ctx.logger.error('auth error: %s', err.stack);
+            docId = conn.docId;
+            ctx.logger.info('data.type = %s', data.type);
+            if(getIsShutdown())
+            {
+              ctx.logger.debug('Server shutdown receive data');
+              return;
+            }
+            if (conn.isCiriticalError && ('message' == data.type || 'getLock' == data.type || 'saveChanges' == data.type ||
+              'isSaveLock' == data.type)) {
+              ctx.logger.warn("conn.isCiriticalError send command: type = %s", data.type);
               sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
               conn.disconnect(true);
               return;
             }
-            break;
-          case 'message'        :
-            yield* onMessage(ctx, conn, data);
-            break;
-          case 'cursor'        :
-            yield* onCursor(ctx, conn, data);
-            break;
-          case 'getLock'        :
-            yield* getLock(ctx, conn, data, false);
-            break;
-          case 'saveChanges'      :
-            yield* saveChanges(ctx, conn, data);
-            break;
-          case 'isSaveLock'      :
-            yield* isSaveLock(ctx, conn, data);
-            break;
-          case 'unSaveLock'      :
-            yield* unSaveLock(ctx, conn, -1, -1, -1);
-            break;	// The index is sent -1, because this is an emergency withdrawal without saving
-          case 'getMessages'      :
-            yield* getMessages(ctx, conn, data);
-            break;
-          case 'unLockDocument'    :
-            yield* checkEndAuthLock(ctx, data.unlock, data.isSave, docId, conn.user.id, data.releaseLocks, data.deleteIndex, conn);
-            break;
-          case 'close':
-            yield* closeDocument(ctx, conn);
-            break;
-          case 'versionHistory'          : {
-            let cmd = new commonDefines.InputCommand(data.cmd);
-            yield* versionHistory(ctx, conn, cmd);
-            break;
-          }
-          case 'openDocument'      : {
-            var cmd = new commonDefines.InputCommand(data.message);
-            cmd.fillFromConnection(conn);
-            yield canvasService.openDocument(ctx, conn, cmd);
-            break;
-          }
-          case 'clientLog':
-            let level = data.level?.toLowerCase();
-            if("trace" === level || "debug" === level || "info" === level || "warn" === level || "error" === level ||  "fatal" === level) {
-              ctx.logger[level]("clientLog: %s", data.msg);
+            if ((conn.isCloseCoAuthoring || (conn.user && conn.user.view)) &&
+              ('getLock' == data.type || 'saveChanges' == data.type || 'isSaveLock' == data.type)) {
+              ctx.logger.warn("conn.user.view||isCloseCoAuthoring access deny: type = %s", data.type);
+              sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
+              conn.disconnect(true);
+              return;
             }
-            if ("error" === level && tenErrorFiles && docId) {
-              let destDir = 'browser/' + docId;
-              yield storage.copyPath(ctx, docId, destDir, undefined, tenErrorFiles);
-              yield* saveErrorChanges(ctx, docId, destDir);
+            yield encryptPasswordParams(ctx, data);
+            switch (data.type) {
+              case 'auth'          :
+                try {
+                  yield* auth(ctx, conn, data);
+                } catch(err){
+                  ctx.logger.error('auth error: %s', err.stack);
+                  sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
+                  conn.disconnect(true);
+                  return;
+                }
+                break;
+              case 'message'        :
+                yield* onMessage(ctx, conn, data);
+                break;
+              case 'cursor'        :
+                yield* onCursor(ctx, conn, data);
+                break;
+              case 'getLock'        :
+                yield getLock(ctx, conn, data, false);
+                break;
+              case 'saveChanges'      :
+                yield* saveChanges(ctx, conn, data);
+                break;
+              case 'isSaveLock'      :
+                yield* isSaveLock(ctx, conn, data);
+                break;
+              case 'unSaveLock'      :
+                yield* unSaveLock(ctx, conn, -1, -1, -1);
+                break;	// The index is sent -1, because this is an emergency withdrawal without saving
+              case 'getMessages'      :
+                yield* getMessages(ctx, conn, data);
+                break;
+              case 'unLockDocument'    :
+                yield* checkEndAuthLock(ctx, data.unlock, data.isSave, docId, conn.user.id, data.releaseLocks, data.deleteIndex, conn);
+                break;
+              case 'close':
+                yield* closeDocument(ctx, conn);
+                break;
+              case 'versionHistory'          : {
+                let cmd = new commonDefines.InputCommand(data.cmd);
+                yield* versionHistory(ctx, conn, cmd);
+                break;
+              }
+              case 'openDocument'      : {
+                var cmd = new commonDefines.InputCommand(data.message);
+                cmd.fillFromConnection(conn);
+                yield canvasService.openDocument(ctx, conn, cmd);
+                break;
+              }
+              case 'clientLog':
+                let level = data.level?.toLowerCase();
+                if("trace" === level || "debug" === level || "info" === level || "warn" === level || "error" === level ||  "fatal" === level) {
+                  ctx.logger[level]("clientLog: %s", data.msg);
+                }
+                if ("error" === level && tenErrorFiles && docId) {
+                  let destDir = 'browser/' + docId;
+                  yield storage.copyPath(ctx, docId, destDir, undefined, tenErrorFiles);
+                  yield* saveErrorChanges(ctx, docId, destDir);
+                }
+                break;
+              case 'extendSession' :
+                ctx.logger.debug("extendSession idletime: %d", data.idletime);
+                conn.sessionIsSendWarning = false;
+                conn.sessionTimeLastAction = new Date().getTime() - data.idletime;
+                break;
+              case 'forceSaveStart' :
+                var forceSaveRes;
+                if (conn.user) {
+                  forceSaveRes = yield startForceSave(ctx, docId, commonDefines.c_oAscForceSaveTypes.Button,
+                    undefined, undefined, conn.user.idOriginal, conn.user.id,
+                    undefined, conn.user.indexUser, undefined, undefined, undefined, undefined, conn);
+                } else {
+                  forceSaveRes = {code: commonDefines.c_oAscServerCommandErrors.UnknownError, time: null};
+                }
+                sendData(ctx, conn, {type: "forceSaveStart", messages: forceSaveRes});
+                break;
+              case 'rpc' :
+                yield* startRPC(ctx, conn, data.responseKey, data.data);
+                break;
+              case 'authChangesAck' :
+                delete conn.authChangesAck;
+                break;
+              default:
+                ctx.logger.debug("unknown command %j", data);
+                break;
             }
-            break;
-          case 'extendSession' :
-            ctx.logger.debug("extendSession idletime: %d", data.idletime);
-            conn.sessionIsSendWarning = false;
-            conn.sessionTimeLastAction = new Date().getTime() - data.idletime;
-            break;
-          case 'forceSaveStart' :
-            var forceSaveRes;
-            if (conn.user) {
-              forceSaveRes = yield startForceSave(ctx, docId, commonDefines.c_oAscForceSaveTypes.Button, undefined, undefined, conn.user.idOriginal, conn.user.id, undefined, conn.user.indexUser);
-            } else {
-              forceSaveRes = {code: commonDefines.c_oAscServerCommandErrors.UnknownError, time: null};
-            }
-            sendData(ctx, conn, {type: "forceSaveStart", messages: forceSaveRes});
-            break;
-          case 'rpc' :
-            yield* startRPC(ctx, conn, data.responseKey, data.data);
-            break;
-          case 'authChangesAck' :
-            delete conn.authChangesAck;
-            break;
-          default:
-            ctx.logger.debug("unknown command %j", data);
-            break;
-        }
-        if(clientStatsD) {
-          if('openDocument' != data.type) {
-            clientStatsD.timing('coauth.data.' + data.type, new Date() - startDate);
+          } catch (e) {
+            ctx.logger.error("error receiving response: type = %s %s", (data && data.type) ? data.type : 'null', e.stack);
           }
-        }
-      } catch (e) {
-        ctx.logger.error("error receiving response: type = %s %s", (data && data.type) ? data.type : 'null', e.stack);
-      }
+        });
       });
-    });
-    conn.on("disconnect", function(reason) {
-      return co(function* () {
-        let ctx = new operationContext.Context();
-        try {
-          ctx.initFromConnection(conn);
-          yield ctx.initTenantCache();
-          yield* closeDocument(ctx, conn, reason);
-        } catch (err) {
-          ctx.logger.error('Error conn close: %s', err.stack);
-        }
+      conn.on("disconnect", function(reason) {
+        return co(function* () {
+          let ctx = new operationContext.Context();
+          try {
+            ctx.initFromConnection(conn);
+            yield ctx.initTenantCache();
+            yield* closeDocument(ctx, conn, reason);
+          } catch (err) {
+            ctx.logger.error('Error conn close: %s', err.stack);
+          }
+        });
       });
-    });
 
-    _checkLicense(ctx, conn);
+      _checkLicense(ctx, conn);
+    } catch(err){
+      ctx.logger.error('connection error: %s', err.stack);
+      sendDataDisconnectReason(ctx, conn, constants.DROP_CODE, constants.DROP_REASON);
+      conn.disconnect(true);
+    }
   });
   io.engine.on("connection_error", (err) => {
     operationContext.global.logger.warn('io.connection_error code=%s, message=%s', err.code, err.message);
@@ -1721,6 +1800,7 @@ exports.install = function(server, callbackFunction) {
     const tenTokenEnableBrowser = ctx.getCfg('services.CoAuthoring.token.enable.browser', cfgTokenEnableBrowser);
     const tenForgottenFiles = ctx.getCfg('services.CoAuthoring.server.forgottenfiles', cfgForgottenFiles);
 
+    ctx.logger.info("Connection closed or timed out: reason = %s", reason);
     var userLocks, reconnected = false, bHasEditors, bHasChanges;
     var docId = conn.docId;
     if (null == docId) {
@@ -1730,7 +1810,7 @@ exports.install = function(server, callbackFunction) {
     let participantsTimestamp;
     var tmpUser = conn.user;
     var isView = tmpUser.view;
-    ctx.logger.info("Connection closed or timed out: reason = %s", reason);
+
     var isCloseCoAuthoringTmp = conn.isCloseCoAuthoring;
     if (reason) {
       //Notify that participant has gone
@@ -1751,7 +1831,7 @@ exports.install = function(server, callbackFunction) {
       }
     } else {
       if (!conn.isCloseCoAuthoring) {
-        tmpUser.view = true;
+        modifyConnectionEditorToView(ctx, conn);
         conn.isCloseCoAuthoring = true;
         yield addPresence(ctx, conn, true);
         if (tenTokenEnableBrowser) {
@@ -1774,7 +1854,7 @@ exports.install = function(server, callbackFunction) {
       if (!participantsTimestamp) {
         participantsTimestamp = Date.now();
       }
-      yield* publish(ctx, {type: commonDefines.c_oPublishType.participantsState, ctx: ctx, docId: docId, userId: tmpUser.id, participantsTimestamp: participantsTimestamp, participants: participants}, docId, tmpUser.id);
+      yield publish(ctx, {type: commonDefines.c_oPublishType.participantsState, ctx: ctx, docId: docId, userId: tmpUser.id, participantsTimestamp: participantsTimestamp, participants: participants}, docId, tmpUser.id);
       tmpUser.view = tmpView;
 
       // For this user, we remove the lock from saving
@@ -1796,11 +1876,11 @@ exports.install = function(server, callbackFunction) {
           }
         }
         //Release locks
-        userLocks = yield* removeUserLocks(ctx, docId, conn.user.id);
+        userLocks = yield removeUserLocks(ctx, docId, conn.user.id);
         if (0 < userLocks.length) {
           //todo send nothing in case of close document
           //sendReleaseLock(conn, userLocks);
-          yield* publish(ctx, {type: commonDefines.c_oPublishType.releaseLock, ctx: ctx, docId: docId, userId: conn.user.id, locks: userLocks}, docId, conn.user.id);
+          yield publish(ctx, {type: commonDefines.c_oPublishType.releaseLock, ctx: ctx, docId: docId, userId: conn.user.id, locks: userLocks}, docId, conn.user.id);
         }
 
         // For this user, remove the Lock from the document
@@ -1822,15 +1902,22 @@ exports.install = function(server, callbackFunction) {
           }
           if (needSaveChanges && !conn.encrypted) {
             // Send changes to save server
-            yield createSaveTimer(ctx, docId, tmpUser.idOriginal, userIndex);
+            let user_lcid = utilsDocService.localeToLCID(conn.lang);
+            yield createSaveTimer(ctx, docId, tmpUser.idOriginal, userIndex, user_lcid, undefined, getIsShutdown());
           } else if (needSendStatus) {
             yield* cleanDocumentOnExitNoChanges(ctx, docId, tmpUser.idOriginal, userIndex);
           } else {
             yield* cleanDocumentOnExit(ctx, docId, false, userIndex);
           }
         } else if (needSendStatus) {
-          yield* sendStatusDocument(ctx, docId, c_oAscChangeBase.No, new commonDefines.OutputAction(commonDefines.c_oAscUserAction.Out, tmpUser.idOriginal), userIndex);
+          yield sendStatusDocument(ctx, docId, c_oAscChangeBase.No, new commonDefines.OutputAction(commonDefines.c_oAscUserAction.Out, tmpUser.idOriginal), userIndex);
         }
+      }
+      let sessionType = isView ? 'view' : 'edit';
+      let sessionTimeMs = new Date().getTime() - conn.sessionTimeConnect;
+      ctx.logger.debug(`closeDocument %s session time:%s`, sessionType, sessionTimeMs);
+      if(clientStatsD) {
+        clientStatsD.timing(`coauth.session.${sessionType}`, sessionTimeMs);
       }
     }
   }
@@ -1844,7 +1931,7 @@ exports.install = function(server, callbackFunction) {
     if (tenTokenEnableBrowser) {
       var checkJwtRes = yield checkJwt(ctx, cmd.getTokenHistory(), commonDefines.c_oAscSecretType.Browser);
       if (checkJwtRes.decoded) {
-        fillVersionHistoryFromJwt(checkJwtRes.decoded, cmd);
+        fillVersionHistoryFromJwt(ctx, checkJwtRes.decoded, cmd);
         docIdNew = cmd.getDocId();
         cmd.setWithAuthorization(true);
       } else {
@@ -1888,31 +1975,19 @@ exports.install = function(server, callbackFunction) {
     return objChangesDocument;
   }
 
-  function* getAllLocks(ctx, docId) {
-    var docLockRes = [];
-    var docLock = yield editorData.getLocks(ctx, docId);
-    for (var i = 0; i < docLock.length; ++i) {
-      docLockRes.push(docLock[i]);
-    }
-    return docLockRes;
-  }
-  function* removeUserLocks(ctx, docId, userId) {
-    var userLocks = [], i;
-    var toCache = [];
-    var docLock = yield* getAllLocks(ctx, docId);
-    for (i = 0; i < docLock.length; ++i) {
-      var elem = docLock[i];
-      if (elem.user === userId) {
-        userLocks.push(elem);
-      } else {
-        toCache.push(elem);
+  async function removeUserLocks(ctx, docId, userId) {
+    let locks = await editorData.getLocks(ctx, docId);
+    let res = [];
+    let toRemove = {};
+    for (let lockId in locks) {
+      let lock = locks[lockId];
+      if (lock.user === userId) {
+        toRemove[lockId] = lock;
+        res.push(lock);
       }
     }
-    //remove all
-    yield editorData.removeLocks(ctx, docId);
-    //set all
-    yield editorData.addLocks(ctx, docId, toCache);
-    return userLocks;
+    await editorData.removeLocks(ctx, docId, toRemove);
+    return res;
   }
 
 	function* checkEndAuthLock(ctx, unlock, isSave, docId, userId, releaseLocks, deleteIndex, conn) {
@@ -1934,7 +2009,7 @@ exports.install = function(server, callbackFunction) {
 			var unlockRes = yield editorData.unlockAuth(ctx, docId, userId);
 			if (commonDefines.c_oAscUnlockRes.Unlocked === unlockRes) {
 				const participantsMap = yield getParticipantMap(ctx, docId);
-				yield* publish(ctx, {
+				yield publish(ctx, {
 					type: commonDefines.c_oPublishType.auth,
                     ctx: ctx,
 					docId: docId,
@@ -1948,10 +2023,10 @@ exports.install = function(server, callbackFunction) {
 
 		//Release locks
 		if (releaseLocks && conn) {
-			const userLocks = yield* removeUserLocks(ctx, docId, userId);
+			const userLocks = yield removeUserLocks(ctx, docId, userId);
 			if (0 < userLocks.length) {
 				sendReleaseLock(ctx, conn, userLocks);
-				yield* publish(ctx, {
+				yield publish(ctx, {
 					type: commonDefines.c_oPublishType.releaseLock,
                     ctx: ctx,
 					docId: docId,
@@ -2011,7 +2086,6 @@ exports.install = function(server, callbackFunction) {
   function* sendFileErrorAuth(ctx, conn, sessionId, errorId, code) {
     const tenTokenEnableBrowser = ctx.getCfg('services.CoAuthoring.token.enable.browser', cfgTokenEnableBrowser);
 
-    conn.isCloseCoAuthoring = true;
     conn.sessionId = sessionId;//restore old
     //Kill previous connections
     connections = _.reject(connections, function(el) {
@@ -2032,20 +2106,20 @@ exports.install = function(server, callbackFunction) {
 
   // Recalculation only for foreign Lock when saving on a client that added/deleted rows or columns
   function _recalcLockArray(userId, _locks, oRecalcIndexColumns, oRecalcIndexRows) {
+    let res = {};
     if (null == _locks) {
-      return false;
+      return res;
     }
-    var count = _locks.length;
     var element = null, oRangeOrObjectId = null;
-    var i;
     var sheetId = -1;
-    var isModify = false;
-    for (i = 0; i < count; ++i) {
+    for (let lockId in _locks) {
+      let isModify = false;
+      let lock = _locks[lockId];
       // we do not count for ourselves
-      if (userId === _locks[i].user) {
+      if (userId === lock.user) {
         continue;
       }
-      element = _locks[i].block;
+      element = lock.block;
       if (c_oAscLockTypeElem.Range !== element["type"] ||
         c_oAscLockTypeElemSubType.InsertColumns === element["subType"] ||
         c_oAscLockTypeElemSubType.InsertRows === element["subType"]) {
@@ -2067,8 +2141,11 @@ exports.install = function(server, callbackFunction) {
         oRangeOrObjectId["r2"] = oRecalcIndexRows[sheetId].getLockMe2(oRangeOrObjectId["r2"]);
         isModify = true;
       }
+      if (isModify) {
+        res[lockId] = lock;
+      }
     }
-    return isModify;
+    return res;
   }
 
   function _addRecalcIndex(oRecalcIndex) {
@@ -2203,7 +2280,10 @@ exports.install = function(server, callbackFunction) {
     return name;
   }
   function isEditMode(permissions, mode) {
-      //as in web-apps/apps/documenteditor/main/app/controller/Main.js
+    //like this.api.asc_setViewMode(!this.appOptions.isEdit && !this.appOptions.isRestrictedEdit);
+    //https://github.com/ONLYOFFICE/web-apps/blob/4a7879b4f88f315fe94d9f7d97c0ed8aa9f82221/apps/documenteditor/main/app/controller/Main.js#L1743
+    //todo permissions in embed editor
+    //https://github.com/ONLYOFFICE/web-apps/blob/72b8350c71e7b314b63b8eec675e76156bb4a2e4/apps/documenteditor/forms/app/controller/ApplicationController.js#L627
     return (!mode || mode !== 'view') && (!permissions || permissions.edit !== false || permissions.review === true ||
         permissions.comment === true || permissions.fillForms === true);
     }
@@ -2220,13 +2300,13 @@ exports.install = function(server, callbackFunction) {
     }
     if (decoded.queryParams) {
       let queryParams = decoded.queryParams;
-      data.lang = queryParams.lang || queryParams.ui || "en-US";
+      data.lang = queryParams.lang || queryParams.ui || constants.TEMPLATES_DEFAULT_LOCALE;
     }
-    if (decoded.fileInfo) {
+    if (wopiClient.isWopiJwtToken(decoded)) {
       let fileInfo = decoded.fileInfo;
+      let queryParams = decoded.queryParams;
       if (openCmd) {
-        let fileType = fileInfo.BaseFileName ? fileInfo.BaseFileName.substr(fileInfo.BaseFileName.lastIndexOf('.') + 1) : "";
-        openCmd.format = fileInfo.FileExtension ? fileInfo.FileExtension.substr(1) : fileType;
+        openCmd.format = wopiClient.getFileTypeByInfo(fileInfo);
         openCmd.title = fileInfo.BreadcrumbDocName || fileInfo.BaseFileName;
       }
       let name = fileInfo.IsAnonymousUser ? "" : fileInfo.UserFriendlyName;
@@ -2240,11 +2320,15 @@ exports.install = function(server, callbackFunction) {
           openCmd.userid = fileInfo.UserId;
         }
       }
+      let permissionsEdit = !fileInfo.ReadOnly && fileInfo.UserCanWrite && queryParams.formsubmit !== "1";
+      let permissionsFillForm = permissionsEdit || queryParams.formsubmit === "1";
       let permissions = {
-        edit: !fileInfo.ReadOnly && fileInfo.UserCanWrite,
+        edit: permissionsEdit,
         review: (fileInfo.SupportsReviewing === false) ? false : (fileInfo.UserCanReview === false ? false : fileInfo.UserCanReview),
         copy: fileInfo.CopyPasteRestrictions !== "CurrentDocumentOnly" && fileInfo.CopyPasteRestrictions !== "BlockAll",
-        print: !fileInfo.DisablePrint && !fileInfo.HidePrintOption
+        print: !fileInfo.DisablePrint && !fileInfo.HidePrintOption,
+        chat: queryParams.dchat!=="1",
+        fillForms: permissionsFillForm
       };
       //todo (review: undefiend)
       // res = deepEqual(data.permissions, permissions, {strict: true});
@@ -2272,7 +2356,7 @@ exports.install = function(server, callbackFunction) {
     } else if (data.documentCallbackUrl && !decoded?.editorConfig?.callbackUrl) {
       //todo callbackUrl required
       res = "editorConfig.callbackUrl";
-    } else if (data.mode && !decoded?.editorConfig?.mode) {
+    } else if (data.mode && 'view' !== data.mode && !decoded?.editorConfig?.mode) {//allow to restrict rights to 'view'
       res = "editorConfig.mode";
     }
     return res;
@@ -2322,7 +2406,8 @@ exports.install = function(server, callbackFunction) {
       if (null != edit.lang) {
         data.lang = edit.lang;
       }
-      if (null != edit.mode) {
+      //allow to restrict rights so don't use token mode in case of 'view'
+      if (null != edit.mode && 'view' !== data.mode) {
         data.mode = edit.mode;
       }
       if (edit.coEditing?.mode) {
@@ -2335,9 +2420,6 @@ exports.install = function(server, callbackFunction) {
         if ((type && typeof type[1] === 'string') || "embedded" === decoded.type) {
           data.coEditingMode = 'strict';
         }
-      }
-      if (null != edit.ds_view) {
-        data.view = edit.ds_view;
       }
       if (null != edit.ds_isCloseCoAuthoring) {
         data.isCloseCoAuthoring = edit.ds_isCloseCoAuthoring;
@@ -2378,7 +2460,7 @@ exports.install = function(server, callbackFunction) {
     }
 
     //todo make required fields
-    if (decoded.url || decoded.payload|| (decoded.key && !decoded.fileInfo)) {
+    if (decoded.url || decoded.payload|| (decoded.key && !wopiClient.isWopiJwtToken(decoded))) {
       ctx.logger.warn('fillDataFromJwt token has invalid format');
       res = false;
     }
@@ -2389,10 +2471,18 @@ exports.install = function(server, callbackFunction) {
     }
     return res;
   }
-  function fillVersionHistoryFromJwt(decoded, cmd) {
-    if (decoded.changesUrl && decoded.previous && (cmd.getServerVersion() === commonDefines.buildVersion)) {
-      cmd.setUrl(decoded.previous.url);
-      cmd.setDocId(decoded.previous.key);
+  function fillVersionHistoryFromJwt(ctx, decoded, cmd) {
+    if (decoded.changesUrl && decoded.previous) {
+      let versionMatch = cmd.getServerVersion() === commonDefines.buildVersion;
+      let openPreviousVersion = cmd.getDocId() === decoded.previous.key;
+      if (versionMatch && openPreviousVersion) {
+        cmd.setUrl(decoded.previous.url);
+        cmd.setDocId(decoded.previous.key);
+      } else {
+        ctx.logger.warn('fillVersionHistoryFromJwt serverVersion mismatch or mismatch between previous url and changes. serverVersion=%s docId=%s', cmd.getServerVersion(), cmd.getDocId());
+        cmd.setUrl(decoded.url);
+        cmd.setDocId(decoded.key);
+      }
     } else {
       cmd.setUrl(decoded.url);
       cmd.setDocId(decoded.key);
@@ -2409,7 +2499,7 @@ exports.install = function(server, callbackFunction) {
     ctx.logger.debug('auth time: %d', data.time);
     if (data.token && data.user) {
       ctx.setUserId(data.user.id);
-      let licenseInfo = yield tenantManager.getTenantLicense(ctx);
+      let [licenseInfo] = yield tenantManager.getTenantLicense(ctx);
       let isDecoded = false;
       //check jwt
       if (tenTokenEnableBrowser) {
@@ -2419,10 +2509,10 @@ exports.install = function(server, callbackFunction) {
           isDecoded = true;
           let decoded = checkJwtRes.decoded;
           let fillDataFromJwtRes = false;
-          if (decoded.fileInfo) {
+          if (wopiClient.isWopiJwtToken(decoded)) {
             //wopi
             fillDataFromJwtRes = fillDataFromWopiJwt(decoded, data);
-          } else if (decoded.editorConfig && undefined !== decoded.editorConfig.ds_view) {
+          } else if (decoded.editorConfig && undefined !== decoded.editorConfig.ds_sessionTimeConnect) {
             //reconnection
             fillDataFromJwtRes = fillDataFromJwt(ctx, decoded, data);
           } else {
@@ -2457,11 +2547,34 @@ exports.install = function(server, callbackFunction) {
       let docId = data.docid;
       const user = data.user;
 
-      let wopiParams = null;
+      let wopiParams = null, wopiParamsFull = null, openedAtStr;
       if (data.documentCallbackUrl) {
         wopiParams = wopiClient.parseWopiCallback(ctx, data.documentCallbackUrl);
         if (wopiParams && wopiParams.userAuth) {
           conn.access_token_ttl = wopiParams.userAuth.access_token_ttl;
+        }
+      }
+      let cmd = null;
+      if (data.openCmd) {
+        cmd = new commonDefines.InputCommand(data.openCmd);
+        cmd.setDocId(docId);
+        if (isDecoded) {
+          cmd.setWithAuthorization(true);
+        }
+      }
+      //todo minimize select calls on opening
+      let result = yield taskResult.select(ctx, docId);
+      let resultRow = result.length > 0 ? result[0] : null;
+      if (wopiParams) {
+        if (resultRow && resultRow.callback) {
+          wopiParamsFull = wopiClient.parseWopiCallback(ctx, data.documentCallbackUrl, resultRow.callback);
+          cmd?.setWopiParams(wopiParamsFull);
+        }
+        if (!wopiParamsFull || !wopiParamsFull.userAuth || !wopiParamsFull.commonInfo) {
+          ctx.logger.warn('invalid wopi callback (maybe postgres<9.5) %j', wopiParams);
+          sendDataDisconnectReason(ctx, conn, constants.DROP_CODE, constants.DROP_REASON);
+          conn.disconnect(true);
+          return;
         }
       }
       //get user index
@@ -2483,10 +2596,10 @@ exports.install = function(server, callbackFunction) {
           }
         }
         let format = data.openCmd && data.openCmd.format;
-        upsertRes = yield canvasService.commandOpenStartPromise(ctx, docId, utils.getBaseUrlByConnection(ctx, conn), true, data.documentCallbackUrl, format);
-        let isInserted = upsertRes.affectedRows == 1;
-        curIndexUser = isInserted ? 1 : upsertRes.insertId;
-        if (isInserted && undefined !== data.timezoneOffset) {
+        upsertRes = yield canvasService.commandOpenStartPromise(ctx, docId, utils.getBaseUrlByConnection(ctx, conn), data.documentCallbackUrl, format);
+        curIndexUser = upsertRes.insertId;
+        //todo update additional in commandOpenStartPromise
+        if ((upsertRes.isInsert || (wopiParams && 2 === curIndexUser)) && (undefined !== data.timezoneOffset || ctx.shardKey || ctx.wopiSrc)) {
           //todo insert in commandOpenStartPromise. insert here for database compatibility
           if (false === canvasService.hasAdditionalCol) {
             let selectRes = yield taskResult.select(ctx, docId);
@@ -2496,8 +2609,17 @@ exports.install = function(server, callbackFunction) {
             let task = new taskResult.TaskResultData();
             task.tenant = ctx.tenant;
             task.key = docId;
-            //todo duplicate created_at because CURRENT_TIMESTAMP uses server timezone
-            task.additional = sqlBase.DocumentAdditional.prototype.setOpenedAt(Date.now(), data.timezoneOffset);
+            if (undefined !== data.timezoneOffset) {
+              //todo duplicate created_at because CURRENT_TIMESTAMP uses server timezone
+              openedAtStr = sqlBase.DocumentAdditional.prototype.setOpenedAt(Date.now(), data.timezoneOffset);
+              task.additional = openedAtStr;
+            }
+            if (ctx.shardKey) {
+              task.additional += sqlBase.DocumentAdditional.prototype.setShardKey(ctx.shardKey);
+            }
+            if (ctx.wopiSrc) {
+              task.additional += sqlBase.DocumentAdditional.prototype.setWopiSrc(ctx.wopiSrc);
+            }
             yield taskResult.update(ctx, task);
           } else {
             ctx.logger.warn('auth unknown column "additional"');
@@ -2536,17 +2658,14 @@ exports.install = function(server, callbackFunction) {
       }
       conn.unsyncTime = null;
       conn.encrypted = data.encrypted;
+      conn.lang = data.lang;
       conn.supportAuthChangesAck = data.supportAuthChangesAck;
 
       const c_LR = constants.LICENSE_RESULT;
       conn.licenseType = c_LR.Success;
       let isLiveViewer = utils.isLiveViewer(conn);
       if (!conn.user.view || isLiveViewer) {
-        let logPrefixTenant = 'License of tenant: ';
-        let logPrefixServer = 'License: ';
-        let logPrefix = tenantManager.isMultitenantMode(ctx) ? logPrefixTenant : logPrefixServer;
-
-        let licenseType = yield* _checkLicenseAuth(ctx, licenseInfo, conn.user.idOriginal, isLiveViewer, logPrefix);
+        let licenseType = yield* _checkLicenseAuth(ctx, licenseInfo, conn.user.idOriginal, isLiveViewer);
         let aggregationCtx, licenseInfoAggregation;
         if ((c_LR.Success === licenseType || c_LR.SuccessLimit === licenseType) && tenantManager.isMultitenantMode(ctx) && !tenantManager.isDefaultTenant(ctx)) {
           //check server aggregation license
@@ -2554,7 +2673,7 @@ exports.install = function(server, callbackFunction) {
           aggregationCtx.init(tenantManager.getDefautTenant(), ctx.docId, ctx.userId);
           //yield ctx.initTenantCache(); //no need
           licenseInfoAggregation = tenantManager.getServerLicense();
-          licenseType = yield* _checkLicenseAuth(aggregationCtx, licenseInfoAggregation, `${ctx.tenant}:${ conn.user.idOriginal}`, isLiveViewer, logPrefixServer);
+          licenseType = yield* _checkLicenseAuth(aggregationCtx, licenseInfoAggregation, `${ctx.tenant}:${ conn.user.idOriginal}`, isLiveViewer);
         }
         conn.licenseType = licenseType;
         if ((c_LR.Success !== licenseType && c_LR.SuccessLimit !== licenseType) || (!tenIsAnonymousSupport && data.IsAnonymousUser)) {
@@ -2562,8 +2681,7 @@ exports.install = function(server, callbackFunction) {
             //do not modify the licenseType because this information is already sent in _checkLicense
             ctx.logger.error('auth: access to editor or live viewer is denied for anonymous users');
           }
-          conn.user.view = true;
-          delete conn.coEditingMode;
+          modifyConnectionEditorToView(ctx, conn);
         } else {
           //don't check IsAnonymousUser via jwt because substituting it doesn't lead to any trouble
           yield* updateEditUsers(ctx, licenseInfo, conn.user.idOriginal, !!data.IsAnonymousUser, isLiveViewer);
@@ -2571,15 +2689,6 @@ exports.install = function(server, callbackFunction) {
             //update server aggregation license
             yield* updateEditUsers(aggregationCtx, licenseInfoAggregation, `${ctx.tenant}:${ conn.user.idOriginal}`, !!data.IsAnonymousUser, isLiveViewer);
           }
-        }
-      }
-
-      let cmd = null;
-      if (data.openCmd) {
-        cmd = new commonDefines.InputCommand(data.openCmd);
-        cmd.fillFromConnection(conn);
-        if (isDecoded) {
-          cmd.setWithAuthorization(true);
         }
       }
 
@@ -2602,20 +2711,6 @@ exports.install = function(server, callbackFunction) {
           }
         }
         return;
-      }
-      let result = yield taskResult.select(ctx, docId);
-      let resultRow = result.length > 0 ? result[0] : null;
-      if (cmd && resultRow && resultRow.callback) {
-        let userAuthStr = sqlBase.UserCallback.prototype.getCallbackByUserIndex(ctx, resultRow.callback, curIndexUser);
-        let wopiParams = wopiClient.parseWopiCallback(ctx, userAuthStr, resultRow.callback);
-        cmd.setWopiParams(wopiParams);
-        if (wopiParams) {
-          documentCallback = null;
-          if (!wopiParams.userAuth || !wopiParams.commonInfo) {
-            yield* sendFileErrorAuth(ctx, conn, data.sessionId, `invalid wopi callback (maybe postgres<9.5) ${JSON.stringify(wopiParams)}`);
-            return;
-          }
-        }
       }
       if (conn.user.idOriginal.length > constants.USER_ID_MAX_LENGTH) {
         //todo refactor DB and remove restrictions
@@ -2651,10 +2746,15 @@ exports.install = function(server, callbackFunction) {
             yield* sendFileErrorAuth(ctx, conn, data.sessionId, 'Update Version error', constants.UPDATE_VERSION_CODE);
             return;
           }
-        } else if (bIsRestore && commonDefines.FileStatus.UpdateVersion === status) {
-          // error version
-          yield* sendFileErrorAuth(ctx, conn, data.sessionId, 'Update Version error', constants.UPDATE_VERSION_CODE);
-          return;
+        } else if (commonDefines.FileStatus.UpdateVersion === status) {
+          if (bIsRestore) {
+            // error version
+            yield* sendFileErrorAuth(ctx, conn, data.sessionId, 'Update Version error', constants.UPDATE_VERSION_CODE);
+            return;
+          } else {
+            modifyConnectionEditorToView(ctx, conn);
+            conn.isCiriticalError = true;
+          }
         } else if (commonDefines.FileStatus.None === status && conn.encrypted) {
           //ok
         } else if (bIsRestore) {
@@ -2691,9 +2791,18 @@ exports.install = function(server, callbackFunction) {
             if (bIsSuccessRestore) {
               // check locks
               var arrayBlocks = data['block'];
-              var getLockRes = yield* getLock(ctx, conn, data, true);
+              var getLockRes = yield getLock(ctx, conn, data, true);
               if (arrayBlocks && (0 === arrayBlocks.length || getLockRes)) {
-                yield* authRestore(ctx, conn, data.sessionId);
+                let wopiLockRes = true;
+                if (wopiParamsFull) {
+                  wopiLockRes = yield wopiClient.lock(ctx, 'LOCK', wopiParamsFull.commonInfo.lockId,
+                    wopiParamsFull.commonInfo.fileInfo, wopiParamsFull.userAuth);
+                }
+                if (wopiLockRes) {
+                  yield* authRestore(ctx, conn, data.sessionId);
+                } else {
+                  yield* sendFileErrorAuth(ctx, conn, data.sessionId, 'Restore error. Wopi lock error.', constants.RESTORE_CODE);
+                }
               } else {
                 yield* sendFileErrorAuth(ctx, conn, data.sessionId, 'Restore error. Locks not checked.', constants.RESTORE_CODE);
               }
@@ -2709,8 +2818,15 @@ exports.install = function(server, callbackFunction) {
         }
       } else {
         conn.sessionId = conn.id;
-        const endAuthRes = yield* endAuth(ctx, conn, false, documentCallback, canvasService.getOpenedAt(resultRow));
+        let openedAt = openedAtStr ? sqlBase.DocumentAdditional.prototype.getOpenedAt(openedAtStr) : canvasService.getOpenedAt(resultRow);
+        const endAuthRes = yield* endAuth(ctx, conn, false, documentCallback, openedAt);
         if (endAuthRes && cmd) {
+          //todo to allow forcesave TemplateSource after convertion(move to better place)
+          if (wopiParamsFull?.commonInfo?.fileInfo?.TemplateSource) {
+            let newChangesLastDate = new Date();
+            newChangesLastDate.setMilliseconds(0);//remove milliseconds avoid issues with MySQL datetime rounding
+            cmd.setExternalChangeInfo(getExternalChangeInfo(conn.user, newChangesLastDate.getTime(), conn.lang));
+          }
           yield canvasService.openDocument(ctx, conn, cmd, upsertRes, bIsRestore);
         }
       }
@@ -2751,8 +2867,10 @@ exports.install = function(server, callbackFunction) {
     if (!tmpUser.view) {
       const userIndex = utils.getIndexFromUserId(tmpUser.id, tmpUser.idOriginal);
       const userAction = new commonDefines.OutputAction(commonDefines.c_oAscUserAction.In, tmpUser.idOriginal);
-      let callback = yield* sendStatusDocument(ctx, docId, c_oAscChangeBase.No, userAction, userIndex, documentCallback, conn.baseUrl);
-      if (!callback && !bIsRestore) {
+      //make async request to speed up file opening
+      sendStatusDocument(ctx, docId, c_oAscChangeBase.No, userAction, userIndex, documentCallback, conn.baseUrl)
+        .catch(err => ctx.logger.error('endAuth sendStatusDocument error: %s', err.stack));
+      if (!bIsRestore) {
         //check forgotten file
         let forgotten = yield storage.listObjects(ctx, docId, tenForgottenFiles);
         hasForgotten = forgotten.length > 0;
@@ -2808,7 +2926,7 @@ exports.install = function(server, callbackFunction) {
       //closing could happen during async action
       return false;
     }
-    yield* publish(ctx, {type: commonDefines.c_oPublishType.participantsState, ctx: ctx, docId: docId, userId: tmpUser.id, participantsTimestamp: participantsTimestamp, participants: participantsMap, waitAuthUserId: waitAuthUserId}, docId, tmpUser.id);
+    yield publish(ctx, {type: commonDefines.c_oPublishType.participantsState, ctx: ctx, docId: docId, userId: tmpUser.id, participantsTimestamp: participantsTimestamp, participants: participantsMap, waitAuthUserId: waitAuthUserId}, docId, tmpUser.id);
     return res;
   }
 
@@ -2911,17 +3029,13 @@ exports.install = function(server, callbackFunction) {
     const tenTypesUpload = ctx.getCfg('services.CoAuthoring.utils.limits_image_types_upload', cfgTypesUpload);
 
     const docId = conn.docId;
-    let docLock;
-    if(EditorTypes.document == conn.editorType){
-      docLock = {};
-      let elem;
-      const allLocks = yield* getAllLocks(ctx, docId);
-      for(let i = 0 ; i < allLocks.length; ++i) {
-        elem = allLocks[i];
-        docLock[elem.block] = elem;
+    let docLock = yield editorData.getLocks(ctx, docId);
+    if (EditorTypes.document !== conn.editorType){
+      let docLockList = [];
+      for (let lockId in docLock) {
+        docLockList.push(docLock[lockId]);
       }
-    } else {
-      docLock = yield* getAllLocks(ctx, docId);
+      docLock = docLockList;
     }
     let allMessages = yield editorData.getMessages(ctx, docId);
     allMessages = allMessages.length > 0 ? allMessages : undefined;//todo client side
@@ -2954,7 +3068,7 @@ exports.install = function(server, callbackFunction) {
   }
 
   function* onMessage(ctx, conn, data) {
-    if (false === conn.permissions.chat) {
+    if (false === conn.permissions?.chat) {
       ctx.logger.warn("insert message permissions.chat==false");
       return;
     }
@@ -2967,7 +3081,7 @@ exports.install = function(server, callbackFunction) {
 
     var messages = [msg];
     sendDataMessage(ctx, conn, messages);
-    yield* publish(ctx, {type: commonDefines.c_oPublishType.message, ctx: ctx, docId: docId, userId: userId, messages: messages}, docId, userId);
+    yield publish(ctx, {type: commonDefines.c_oPublishType.message, ctx: ctx, docId: docId, userId: userId, messages: messages}, docId, userId);
   }
 
   function* onCursor(ctx, conn, data) {
@@ -2978,100 +3092,55 @@ exports.install = function(server, callbackFunction) {
     ctx.logger.info("send cursor: %s", msg);
 
     var messages = [msg];
-    yield* publish(ctx, {type: commonDefines.c_oPublishType.cursor, ctx: ctx, docId: docId, userId: userId, messages: messages}, docId, userId);
+    yield publish(ctx, {type: commonDefines.c_oPublishType.cursor, ctx: ctx, docId: docId, userId: userId, messages: messages}, docId, userId);
   }
-
-  function* getLock(ctx, conn, data, bIsRestore) {
-    ctx.logger.info("getLock");
-    var fLock = null;
+  // For Word block is now string "guid"
+  // For Excel block is now object { sheetId, type, rangeOrObjectId, guid }
+  // For presentations, this is an object { type, val } or { type, slideId, objId }
+  async function getLock(ctx, conn, data, bIsRestore) {
+    ctx.logger.debug("getLock");
+    var fCheckLock = null;
     switch (conn.editorType) {
       case EditorTypes.document:
         // Word
-        fLock = getLockWord;
+        fCheckLock = _checkLockWord;
         break;
       case EditorTypes.spreadsheet:
         // Excel
-        fLock = getLockExcel;
+        fCheckLock = _checkLockExcel;
         break;
       case EditorTypes.presentation:
         // PP
-        fLock = getLockPresentation;
+        fCheckLock = _checkLockPresentation;
         break;
+      default:
+        return false;
     }
-    return fLock ? yield* fLock(ctx, conn, data, bIsRestore) : false;
-  }
-
-  function* getLockWord(ctx, conn, data, bIsRestore) {
-    var docId = conn.docId, userId = conn.user.id, arrayBlocks = data.block;
-    var i;
-    var checkRes = yield* _checkLock(ctx, docId, arrayBlocks);
-    var documentLocks = checkRes.documentLocks;
-    if (checkRes.res) {
-      //Ok. take lock
-      var toCache = [];
-      for (i = 0; i < arrayBlocks.length; ++i) {
-        var block = arrayBlocks[i];
-        var elem = {time: Date.now(), user: userId, block: block};
-        documentLocks[block] = elem;
-        toCache.push(elem);
+    let docId = conn.docId, userId = conn.user.id, arrayBlocks = data.block;
+    let locks = arrayBlocks.reduce(function(map, block) {
+      //todo use one id
+      map[block.guid || block] = {time: Date.now(), user: userId, block: block};
+      return map;
+    }, {});
+    let addRes = await editorData.addLocksNX(ctx, docId, locks);
+    let documentLocks = addRes.allLocks;
+    let isAllAdded = Object.keys(addRes.lockConflict).length === 0;
+    if (!isAllAdded || !fCheckLock(ctx, docId, documentLocks, locks, arrayBlocks, userId)) {
+      //remove new locks
+      let toRemove = {};
+      for (let lockId in locks) {
+        if (!addRes.lockConflict[lockId]) {
+          toRemove[lockId] = locks[lockId];
+          delete documentLocks[lockId];
+        }
       }
-      yield editorData.addLocks(ctx, docId, toCache);
-    } else if (bIsRestore) {
-      return false;
-    }
-    //to the one who made the request we return as quickly as possible
-    sendData(ctx, conn, {type: "getLock", locks: documentLocks});
-    yield* publish(ctx, {type: commonDefines.c_oPublishType.getLock, ctx: ctx, docId: docId, userId: userId, documentLocks: documentLocks}, docId, userId);
-    return true;
-  }
-
-  // For Excel block is now object { sheetId, type, rangeOrObjectId, guid }
-  function* getLockExcel(ctx, conn, data, bIsRestore) {
-    var docId = conn.docId, userId = conn.user.id, arrayBlocks = data.block;
-    var i;
-    var checkRes = yield* _checkLockExcel(ctx, docId, arrayBlocks, userId);
-    var documentLocks = checkRes.documentLocks;
-    if (checkRes.res) {
-      //Ok. take lock
-      var toCache = [];
-      for (i = 0; i < arrayBlocks.length; ++i) {
-        var block = arrayBlocks[i];
-        var elem = {time: Date.now(), user: userId, block: block};
-        documentLocks.push(elem);
-        toCache.push(elem);
+      await editorData.removeLocks(ctx, docId, toRemove);
+      if (bIsRestore) {
+        return false;
       }
-      yield editorData.addLocks(ctx, docId, toCache);
-    } else if (bIsRestore) {
-      return false;
     }
-    //to the one who made the request we return as quickly as possible
     sendData(ctx, conn, {type: "getLock", locks: documentLocks});
-    yield* publish(ctx, {type: commonDefines.c_oPublishType.getLock, ctx: ctx, docId: docId, userId: userId, documentLocks: documentLocks}, docId, userId);
-    return true;
-  }
-
-  // For presentations, this is an object { type, val } or { type, slideId, objId }
-  function* getLockPresentation(ctx, conn, data, bIsRestore) {
-    var docId = conn.docId, userId = conn.user.id, arrayBlocks = data.block;
-    var i;
-    var checkRes = yield* _checkLockPresentation(ctx, docId, arrayBlocks, userId);
-    var documentLocks = checkRes.documentLocks;
-    if (checkRes.res) {
-      //Ok. take lock
-      var toCache = [];
-      for (i = 0; i < arrayBlocks.length; ++i) {
-        var block = arrayBlocks[i];
-        var elem = {time: Date.now(), user: userId, block: block};
-        documentLocks.push(elem);
-        toCache.push(elem);
-      }
-      yield editorData.addLocks(ctx, docId, toCache);
-    } else if (bIsRestore) {
-      return false;
-    }
-    //to the one who made the request we return as quickly as possible
-    sendData(ctx, conn, {type: "getLock", locks: documentLocks});
-    yield* publish(ctx, {type: commonDefines.c_oPublishType.getLock, ctx: ctx, docId: docId, userId: userId, documentLocks: documentLocks}, docId, userId);
+    await publish(ctx, {type: commonDefines.c_oPublishType.getLock, ctx: ctx, docId: docId, userId: userId, documentLocks: documentLocks}, docId, userId);
     return true;
   }
 
@@ -3155,14 +3224,10 @@ exports.install = function(server, callbackFunction) {
         const oRecalcIndexRows = _addRecalcIndex(tmpAdditionalInfo["indexRows"]);
         // Now we need to recalculate indexes for lock elements
         if (null !== oRecalcIndexColumns || null !== oRecalcIndexRows) {
-          const docLock = yield* getAllLocks(ctx, docId);
-          if (_recalcLockArray(userId, docLock, oRecalcIndexColumns, oRecalcIndexRows)) {
-            let toCache = [];
-            for (let i = 0; i < docLock.length; ++i) {
-              toCache.push(docLock[i]);
-            }
-            yield editorData.removeLocks(ctx, docId);
-            yield editorData.addLocks(ctx, docId, toCache);
+          let docLock = yield editorData.getLocks(ctx, docId);
+          let docLockMod = _recalcLockArray(userId, docLock, oRecalcIndexColumns, oRecalcIndexRows);
+          if (Object.keys(docLockMod).length > 0) {
+            yield editorData.addLocks(ctx, docId, docLockMod);
           }
         }
       }
@@ -3170,7 +3235,7 @@ exports.install = function(server, callbackFunction) {
       let userLocks = [];
       if (data.releaseLocks) {
 		  //Release locks
-		  userLocks = yield* removeUserLocks(ctx, docId, userId);
+		  userLocks = yield removeUserLocks(ctx, docId, userId);
       }
       // For this user, we remove Lock from the document if the unlock flag has arrived
       const checkEndAuthLockRes = yield* checkEndAuthLock(ctx, data.unlock, false, docId, userId);
@@ -3191,14 +3256,14 @@ exports.install = function(server, callbackFunction) {
             value.time = value.time.getTime();
           })
         }
-        yield* publish(ctx, {type: commonDefines.c_oPublishType.changes, ctx: ctx, docId: docId, userId: userId,
+        yield publish(ctx, {type: commonDefines.c_oPublishType.changes, ctx: ctx, docId: docId, userId: userId,
           changes: changesToSend, startIndex: startIndex, changesIndex: puckerIndex, syncChangesIndex: puckerIndex,
           locks: arrLocks, excelAdditionalInfo: data.excelAdditionalInfo, endSaveChanges: data.endSaveChanges}, docId, userId);
       }
       // Automatically remove the lock ourselves and send the index to save
       yield* unSaveLock(ctx, conn, changesIndex, newChangesLastTime, puckerIndex);
       //last save
-      let changeInfo = getExternalChangeInfo(conn.user, newChangesLastTime);
+      let changeInfo = getExternalChangeInfo(conn.user, newChangesLastTime, conn.lang);
       yield resetForceSaveAfterChanges(ctx, docId, newChangesLastTime, puckerIndex, utils.getBaseUrlByConnection(ctx, conn), changeInfo);
     } else {
       let changesToSend = arrNewDocumentChanges;
@@ -3209,13 +3274,13 @@ exports.install = function(server, callbackFunction) {
           value.time = value.time.getTime();
         })
       }
-      let isPublished = yield* publish(ctx, {type: commonDefines.c_oPublishType.changes, ctx: ctx, docId: docId, userId: userId,
+      let isPublished = yield publish(ctx, {type: commonDefines.c_oPublishType.changes, ctx: ctx, docId: docId, userId: userId,
         changes: changesToSend, startIndex: startIndex, changesIndex: puckerIndex, syncChangesIndex: puckerIndex,
         locks: [], excelAdditionalInfo: undefined, endSaveChanges: data.endSaveChanges}, docId, userId);
       sendData(ctx, conn, {type: 'savePartChanges', changesIndex: changesIndex, syncChangesIndex: puckerIndex});
       if (!isPublished) {
         //stub for lockDocumentsTimerId
-        yield* publish(ctx, {type: commonDefines.c_oPublishType.changesNotify, ctx: ctx, docId: docId});
+        yield publish(ctx, {type: commonDefines.c_oPublishType.changesNotify, ctx: ctx, docId: docId});
       }
     }
   }
@@ -3271,45 +3336,21 @@ exports.install = function(server, callbackFunction) {
     sendDataMessage(ctx, conn, allMessages);
   }
 
-  function* _checkLock(ctx, docId, arrayBlocks) {
-    // Data is array now
-    var isLock = false;
-    var allLocks = yield* getAllLocks(ctx, docId);
-    var documentLocks = {};
-    for(var i = 0 ; i < allLocks.length; ++i) {
-      var elem = allLocks[i];
-      documentLocks[elem.block] =elem;
-    }
-    if (arrayBlocks.length > 0) {
-      for (var i = 0; i < arrayBlocks.length; ++i) {
-        var block = arrayBlocks[i];
-        ctx.logger.info("getLock id: %s", block);
-        if (documentLocks.hasOwnProperty(block) && documentLocks[block] !== null) {
-          isLock = true;
-          break;
-        }
-      }
-    } else {
-      isLock = true;
-    }
-    return {res: !isLock, documentLocks: documentLocks};
+  function _checkLockWord(ctx, docId, documentLocks, newLocks, arrayBlocks, userId) {
+    return true;
   }
-
-  function* _checkLockExcel(ctx, docId, arrayBlocks, userId) {
+  function _checkLockExcel(ctx, docId, documentLocks, newLocks, arrayBlocks, userId) {
     // Data is array now
     var documentLock;
     var isLock = false;
     var isExistInArray = false;
     var i, blockRange;
-    var documentLocks = yield* getAllLocks(ctx, docId);
     var lengthArray = (arrayBlocks) ? arrayBlocks.length : 0;
     for (i = 0; i < lengthArray && false === isLock; ++i) {
       blockRange = arrayBlocks[i];
-      for (var keyLockInArray in documentLocks) {
-        if (true === isLock) {
-          break;
-        }
-        if (!documentLocks.hasOwnProperty(keyLockInArray)) {
+      for (let keyLockInArray in documentLocks) {
+        if (newLocks[keyLockInArray]) {
+          //skip just added
           continue;
         }
         documentLock = documentLocks[keyLockInArray];
@@ -3346,41 +3387,43 @@ exports.install = function(server, callbackFunction) {
           continue;
         }
         isLock = compareExcelBlock(blockRange, documentLock.block);
+        if (true === isLock) {
+          break;
+        }
       }
     }
     if (0 === lengthArray) {
       isLock = true;
     }
-    return {res: !isLock && !isExistInArray, documentLocks: documentLocks};
+    return !isLock && !isExistInArray;
   }
 
-  function* _checkLockPresentation(ctx, docId, arrayBlocks, userId) {
+  function _checkLockPresentation(ctx, docId, documentLocks, newLocks, arrayBlocks, userId) {
     // Data is array now
     var isLock = false;
-    var i, documentLock, blockRange;
-    var documentLocks = yield* getAllLocks(ctx, docId);
+    var i, blockRange;
     var lengthArray = (arrayBlocks) ? arrayBlocks.length : 0;
     for (i = 0; i < lengthArray && false === isLock; ++i) {
       blockRange = arrayBlocks[i];
-      for (var keyLockInArray in documentLocks) {
-        if (true === isLock) {
-          break;
-        }
-        if (!documentLocks.hasOwnProperty(keyLockInArray)) {
+      for (let keyLockInArray in documentLocks) {
+        if (newLocks[keyLockInArray]) {
+          //skip just added
           continue;
         }
-        documentLock = documentLocks[keyLockInArray];
-
+        let documentLock = documentLocks[keyLockInArray];
         if (documentLock.user === userId || !(documentLock.block)) {
           continue;
         }
         isLock = comparePresentationBlock(blockRange, documentLock.block);
+        if (true === isLock) {
+          break;
+        }
       }
     }
     if (0 === lengthArray) {
       isLock = true;
     }
-    return {res: !isLock, documentLocks: documentLocks};
+    return !isLock;
   }
 
 	function _checkLicense(ctx, conn) {
@@ -3408,12 +3451,12 @@ exports.install = function(server, callbackFunction) {
 					}
 				}
 
-				let licenseInfo = yield tenantManager.getTenantLicense(ctx);
+				let [licenseInfo] = yield tenantManager.getTenantLicense(ctx);
 
 				sendData(ctx, conn, {
 					type: 'license', license: {
 						type: licenseInfo.type,
-						light: licenseInfo.light,
+						light: false,//todo remove in sdk
 						mode: licenseInfo.mode,
 						rights: rights,
 						buildVersion: commonDefines.buildVersion,
@@ -3423,8 +3466,7 @@ exports.install = function(server, callbackFunction) {
 						liveViewerSupport: utils.isLiveViewerSupport(licenseInfo),
 						branding: licenseInfo.branding,
 						customization: licenseInfo.customization,
-						advancedApi: licenseInfo.advancedApi,
-						plugins: licenseInfo.plugins
+						advancedApi: licenseInfo.advancedApi
 					}
 				});
 				ctx.logger.info('_checkLicense end');
@@ -3434,80 +3476,70 @@ exports.install = function(server, callbackFunction) {
 		});
 	}
 
-  function* _checkLicenseAuth(ctx, licenseInfo, userId, isLiveViewer, logPrefix) {
+  function* _checkLicenseAuth(ctx, licenseInfo, userId, isLiveViewer) {
     const tenWarningLimitPercents = ctx.getCfg('license.warning_limit_percents', cfgWarningLimitPercents) / 100;
-
-    let licenseWarningLimitUsers = false;
-    let licenseWarningLimitUsersView = false;
-    let licenseWarningLimitConnections = false;
-    let licenseWarningLimitConnectionsLive = false;
+    const tenNotificationRuleLicenseLimitEdit = ctx.getCfg(`notification.rules.licenseLimitEdit.template`, cfgNotificationRuleLicenseLimitEdit);
+    const tenNotificationRuleLicenseLimitLiveViewer = ctx.getCfg(`notification.rules.licenseLimitLiveViewer.template`, cfgNotificationRuleLicenseLimitLiveViewer);
     const c_LR = constants.LICENSE_RESULT;
     let licenseType = licenseInfo.type;
     if (c_LR.Success === licenseType || c_LR.SuccessLimit === licenseType) {
+      let notificationLimit;
+      let notificationTemplate = tenNotificationRuleLicenseLimitEdit;
+      let notificationType = notificationTypes.LICENSE_LIMIT_EDIT;
+      let notificationPercent = 100;
       if (licenseInfo.usersCount) {
         const nowUTC = getLicenseNowUtc();
+        notificationLimit = 'users';
         if(isLiveViewer) {
-          const arrUsers = yield editorData.getPresenceUniqueViewUser(ctx, nowUTC);
+          notificationTemplate = tenNotificationRuleLicenseLimitLiveViewer;
+          notificationType = notificationTypes.LICENSE_LIMIT_LIVE_VIEWER;
+          const arrUsers = yield editorStat.getPresenceUniqueViewUser(ctx, nowUTC);
           if (arrUsers.length >= licenseInfo.usersViewCount && (-1 === arrUsers.findIndex((element) => {return element.userid === userId}))) {
-            licenseType = c_LR.UsersViewCount;
+            licenseType = licenseInfo.hasLicense ? c_LR.UsersViewCount : c_LR.UsersViewCountOS;
+          } else if (licenseInfo.usersViewCount * tenWarningLimitPercents <= arrUsers.length) {
+            notificationPercent = tenWarningLimitPercents * 100;
           }
-          licenseWarningLimitUsersView = licenseInfo.usersViewCount * tenWarningLimitPercents <= arrUsers.length;
         } else {
-          const arrUsers = yield editorData.getPresenceUniqueUser(ctx, nowUTC);
+          const arrUsers = yield editorStat.getPresenceUniqueUser(ctx, nowUTC);
           if (arrUsers.length >= licenseInfo.usersCount && (-1 === arrUsers.findIndex((element) => {return element.userid === userId}))) {
-            licenseType = c_LR.UsersCount;
+            licenseType = licenseInfo.hasLicense ? c_LR.UsersCount : c_LR.UsersCountOS;
+          } else if(licenseInfo.usersCount * tenWarningLimitPercents <= arrUsers.length) {
+            notificationPercent = tenWarningLimitPercents * 100;
           }
-          licenseWarningLimitUsers = licenseInfo.usersCount * tenWarningLimitPercents <= arrUsers.length;
         }
-      } else if(isLiveViewer) {
-        const connectionsLiveCount = licenseInfo.connectionsView;
-        const liveViewerConnectionsCount = yield editorData.getLiveViewerConnectionsCount(ctx, connections);
-        if (liveViewerConnectionsCount >= connectionsLiveCount) {
-          licenseType = c_LR.ConnectionsLive;
-        }
-        licenseWarningLimitConnectionsLive = connectionsLiveCount * tenWarningLimitPercents <= liveViewerConnectionsCount;
       } else {
-        const connectionsCount = licenseInfo.connections;
-        const editConnectionsCount = yield editorData.getEditorConnectionsCount(ctx, connections);
-        if (editConnectionsCount >= connectionsCount) {
-          licenseType = c_LR.Connections;
+        notificationLimit = 'connections';
+        if (isLiveViewer) {
+          notificationTemplate = tenNotificationRuleLicenseLimitLiveViewer;
+          notificationType = notificationTypes.LICENSE_LIMIT_LIVE_VIEWER;
+          const connectionsLiveCount = licenseInfo.connectionsView;
+          const liveViewerConnectionsCount = yield editorStat.getLiveViewerConnectionsCount(ctx, connections);
+          if (liveViewerConnectionsCount >= connectionsLiveCount) {
+            licenseType = licenseInfo.hasLicense ? c_LR.ConnectionsLive : c_LR.ConnectionsLiveOS;
+          } else if(connectionsLiveCount * tenWarningLimitPercents <= liveViewerConnectionsCount){
+            notificationPercent = tenWarningLimitPercents * 100;
+          }
+        } else {
+          const connectionsCount = licenseInfo.connections;
+          const editConnectionsCount = yield editorStat.getEditorConnectionsCount(ctx, connections);
+          if (editConnectionsCount >= connectionsCount) {
+            licenseType = licenseInfo.hasLicense ? c_LR.Connections : c_LR.ConnectionsOS;
+          } else if (connectionsCount * tenWarningLimitPercents <= editConnectionsCount) {
+            notificationPercent = tenWarningLimitPercents * 100;
+          }
         }
-        licenseWarningLimitConnections = connectionsCount * tenWarningLimitPercents <= editConnectionsCount;
       }
-    }
-
-    if (c_LR.UsersCount === licenseType) {
-      if (!licenseInfo.hasLicense) {
-        licenseType = c_LR.UsersCountOS;
-      }
-      ctx.logger.error(logPrefix + 'User limit exceeded!!!');
-    } else if (c_LR.UsersViewCount === licenseType) {
-        if (!licenseInfo.hasLicense) {
-          licenseType = c_LR.UsersViewCountOS;
+      if ((c_LR.Success !== licenseType && c_LR.SuccessLimit !== licenseType) || 100 !== notificationPercent) {
+        const applicationName = (process.env.APPLICATION_NAME || "").toUpperCase();
+        const title = util.format(notificationTemplate.title, applicationName);
+        const message = util.format(notificationTemplate.body, notificationPercent, notificationLimit);
+        if (100 !== notificationPercent) {
+          ctx.logger.warn(message);
+        } else {
+          ctx.logger.error(message);
         }
-        ctx.logger.error(logPrefix + 'User Live Viewer limit exceeded!!!');
-    } else if (c_LR.Connections === licenseType) {
-      if (!licenseInfo.hasLicense) {
-        licenseType = c_LR.ConnectionsOS;
-      }
-      ctx.logger.error(logPrefix + 'Connection limit exceeded!!!');
-    } else if (c_LR.ConnectionsLive === licenseType) {
-      if (!licenseInfo.hasLicense) {
-        licenseType = c_LR.ConnectionsLiveOS;
-      }
-      ctx.logger.error(logPrefix + 'Connection Live Viewer limit exceeded!!!');
-    } else {
-      if (licenseWarningLimitUsers) {
-        ctx.logger.warn(logPrefix + 'Warning User limit exceeded!!!');
-      }
-      if (licenseWarningLimitUsersView) {
-        ctx.logger.warn(logPrefix + 'Warning User Live Viewer limit exceeded!!!');
-      }
-      if (licenseWarningLimitConnections) {
-        ctx.logger.warn(logPrefix + 'Warning Connection limit exceeded!!!');
-      }
-      if (licenseWarningLimitConnectionsLive) {
-        ctx.logger.warn(logPrefix + 'Warning Connection Live Viewer limit exceeded!!!');
+        //todo with yield service could throw error
+        void notificationService.notify(ctx, notificationType, title, message, notificationType + notificationPercent);
       }
     }
     return licenseType;
@@ -3626,9 +3658,9 @@ exports.install = function(server, callbackFunction) {
             for (i = 0; i < participants.length; ++i) {
               participant = participants[i];
               if (data.needUrlKey) {
-                if (0 == data.needUrlMethod) {
+                if (0 === data.needUrlMethod) {
                   outputData.setData(yield storage.getSignedUrls(ctx, participant.baseUrl, data.needUrlKey, data.needUrlType, data.creationDate));
-                } else if (1 == data.needUrlMethod) {
+                } else if (1 === data.needUrlMethod) {
                   outputData.setData(yield storage.getSignedUrl(ctx, participant.baseUrl, data.needUrlKey, data.needUrlType, undefined, data.creationDate));
                 } else {
                   let url;
@@ -3664,7 +3696,8 @@ exports.install = function(server, callbackFunction) {
           case commonDefines.c_oPublishType.shutdown:
             //flag prevent new socket connections and receive data from exist connections
             shutdownFlag = data.status;
-            ctx.logger.warn('start shutdown:%b', shutdownFlag);
+            wopiClient.setIsShutdown(shutdownFlag);
+            ctx.logger.warn('start shutdown:%s', shutdownFlag);
             if (shutdownFlag) {
               ctx.logger.warn('active connections: %d', connections.length);
               //do not stop the server, because sockets and all requests will be unavailable
@@ -3712,7 +3745,7 @@ exports.install = function(server, callbackFunction) {
             if (hasChanges) {
               let participants = yield getParticipantMap(ctx, data.docId);
               let participantsTimestamp = Date.now();
-              yield* publish(ctx, {type: commonDefines.c_oPublishType.participantsState, ctx: ctx, docId: data.docId, userId: null, participantsTimestamp: participantsTimestamp, participants: participants});
+              yield publish(ctx, {type: commonDefines.c_oPublishType.participantsState, ctx: ctx, docId: data.docId, userId: null, participantsTimestamp: participantsTimestamp, participants: participants});
             }
             break;
           case commonDefines.c_oPublishType.rpc:
@@ -3732,7 +3765,7 @@ exports.install = function(server, callbackFunction) {
 
   function* collectStats(ctx, countEdit, countLiveView, countView) {
     let now = Date.now();
-    yield editorData.setEditorConnections(ctx, countEdit, countLiveView, countView, now, PRECISION);
+    yield editorStat.setEditorConnections(ctx, countEdit, countLiveView, countView, now, PRECISION);
   }
   function expireDoc() {
     return co(function* () {
@@ -3792,7 +3825,7 @@ exports.install = function(server, callbackFunction) {
           if (constants.CONN_CLOSED === conn.conn.readyState) {
             ctx.logger.error('expireDoc connection closed');
           }
-          yield addPresence(ctx, conn, false);
+          yield updatePresence(ctx, conn);
           if (utils.isLiveViewer(conn)) {
             countLiveViewByShard++;
             tenant.countLiveViewByShard++;
@@ -3809,16 +3842,16 @@ exports.install = function(server, callbackFunction) {
             ctx.setTenant(tenantId);
             let tenant = tenants[tenantId];
             yield* collectStats(ctx, tenant.countEditByShard, tenant.countLiveViewByShard, tenant.countViewByShard);
-            yield editorData.setEditorConnectionsCountByShard(ctx, SHARD_ID, tenant.countEditByShard);
-            yield editorData.setLiveViewerConnectionsCountByShard(ctx, SHARD_ID, tenant.countLiveViewByShard);
-            yield editorData.setViewerConnectionsCountByShard(ctx, SHARD_ID, tenant.countViewByShard);
+            yield editorStat.setEditorConnectionsCountByShard(ctx, SHARD_ID, tenant.countEditByShard);
+            yield editorStat.setLiveViewerConnectionsCountByShard(ctx, SHARD_ID, tenant.countLiveViewByShard);
+            yield editorStat.setViewerConnectionsCountByShard(ctx, SHARD_ID, tenant.countViewByShard);
             if (clientStatsD) {
               //todo with multitenant
-              let countEdit = yield editorData.getEditorConnectionsCount(ctx, connections);
+              let countEdit = yield editorStat.getEditorConnectionsCount(ctx, connections);
               clientStatsD.gauge('expireDoc.connections.edit', countEdit);
-              let countLiveView = yield editorData.getLiveViewerConnectionsCount(ctx, connections);
+              let countLiveView = yield editorStat.getLiveViewerConnectionsCount(ctx, connections);
               clientStatsD.gauge('expireDoc.connections.liveview', countLiveView);
-              let countView = yield editorData.getViewerConnectionsCount(ctx, connections);
+              let countView = yield editorStat.getViewerConnectionsCount(ctx, connections);
               clientStatsD.gauge('expireDoc.connections.view', countView);
             }
           }
@@ -3828,9 +3861,10 @@ exports.install = function(server, callbackFunction) {
           let aggregationCtx = new operationContext.Context();
           aggregationCtx.init(tenantManager.getDefautTenant(), ctx.docId, ctx.userId);
           //yield ctx.initTenantCache();//no need
-          yield editorData.setEditorConnectionsCountByShard(aggregationCtx, SHARD_ID, countEditByShard);
-          yield editorData.setLiveViewerConnectionsCountByShard(aggregationCtx, SHARD_ID, countLiveViewByShard);
-          yield editorData.setViewerConnectionsCountByShard(aggregationCtx, SHARD_ID, countViewByShard);
+          yield* collectStats(aggregationCtx, countEditByShard, countLiveViewByShard, countViewByShard);
+          yield editorStat.setEditorConnectionsCountByShard(aggregationCtx, SHARD_ID, countEditByShard);
+          yield editorStat.setLiveViewerConnectionsCountByShard(aggregationCtx, SHARD_ID, countLiveViewByShard);
+          yield editorStat.setViewerConnectionsCountByShard(aggregationCtx, SHARD_ID, countViewByShard);
         }
         ctx.initDefault();
       } catch (err) {
@@ -3898,34 +3932,45 @@ exports.install = function(server, callbackFunction) {
       }
       gc.startGC();
 
-      let tableName = cfgTableResult;
-      const tableRequiredColumn = 'tenant';
       //check data base compatibility
-      sqlBase.getTableColumns(operationContext.global, tableName).then(function(res) {
-        let index = res.findIndex((currentValue) => {
-          for (let key in currentValue) {
-            if (currentValue.hasOwnProperty(key) && 'column_name' === key.toLowerCase()) {
-              return tableRequiredColumn === currentValue[key];
-            }
+      const tables = [
+        [cfgTableResult, constants.TABLE_RESULT_SCHEMA],
+        [cfgTableChanges, constants.TABLE_CHANGES_SCHEMA]
+      ];
+      const requestPromises = tables.map(table => isSchemaCompatible(table));
+
+      Promise.all(requestPromises).then(
+        checkResult => {
+          if (checkResult.includes(false)) {
+            return;
           }
-        });
-        if (-1 !== index || 0 === res.length) {
-          return editorData.connect().then(function() {
-            callbackFunction();
-          }).catch(err => {
-            operationContext.global.logger.error('editorData error: %s', err.stack);
-          });
-        } else {
-          operationContext.global.logger.error('DB table "%s" does not contain %s column, columns info: %j', tableName, tableRequiredColumn, res);
-        }
-      }).catch(err => {
-        operationContext.global.logger.error('getTableColumns error: %s', err.stack);
-      });
+          editorData
+            .connect()
+            .then(() => editorStat.connect())
+            .then(() => callbackFunction())
+            .catch(err => {
+              operationContext.global.logger.error('editorData error: %s', err.stack);
+            });
+        },
+        error => operationContext.global.logger.error('getTableColumns error: %s', error.stack)
+      );
     });
   });
 };
-exports.setLicenseInfo = function(data, original ) {
+exports.setLicenseInfo = async function(globalCtx, data, original) {
   tenantManager.setDefLicense(data, original);
+
+  await utilsDocService.notifyLicenseExpiration(globalCtx, data.endDate);
+
+  const tenantsList = await tenantManager.getAllTenants(globalCtx);
+  for (const tenant of tenantsList) {
+    let ctx = new operationContext.Context();
+    ctx.setTenant(tenant);
+    await ctx.initTenantCache();
+
+    const [licenseInfo] = await tenantManager.getTenantLicense(ctx);
+    await utilsDocService.notifyLicenseExpiration(ctx, licenseInfo.endDate);
+  }
 };
 exports.healthCheck = function(req, res) {
   return co(function*() {
@@ -3939,13 +3984,18 @@ exports.healthCheck = function(req, res) {
       yield sqlBase.healthCheck(ctx);
       ctx.logger.debug('healthCheck database');
       //check redis connection
-      if (editorData.isConnected()) {
-        yield editorData.ping();
+      const healthData = yield editorData.healthCheck();
+      if (healthData) {
         ctx.logger.debug('healthCheck editorData');
       } else {
-        throw new Error('redis disconnected');
+        throw new Error('editorData');
       }
-
+      const healthStat = yield editorStat.healthCheck();
+      if (healthStat) {
+        ctx.logger.debug('healthCheck editorStat');
+      } else {
+        throw new Error('editorStat');
+      }
       const healthPubsub = yield pubsub.healthCheck();
       if (healthPubsub) {
         ctx.logger.debug('healthCheck pubsub');
@@ -3960,18 +4010,12 @@ exports.healthCheck = function(req, res) {
       }
 
       //storage
-      const clusterId = cluster.isWorker ? cluster.worker.id : '';
-      const tempName = 'hc_' + os.hostname() + '_' + clusterId + '_' + Math.round(Math.random() * HEALTH_CHECK_KEY_MAX);
-      const tempBuffer = Buffer.from([1, 2, 3, 4, 5]);
-      //It's proper to putObject one tempName
-      yield storage.putObject(ctx, tempName, tempBuffer, tempBuffer.length);
-      try {
-        //try to prevent case, when another process can remove same tempName
-        yield storage.deleteObject(ctx, tempName);
-      } catch (err) {
-        ctx.logger.warn('healthCheck error %s', err.stack);
-      }
+      yield storage.healthCheck(ctx);
       ctx.logger.debug('healthCheck storage');
+      if (storage.isDiffrentPersistentStorage()) {
+        yield storage.healthCheck(ctx, cfgForgottenFiles);
+        ctx.logger.debug('healthCheck storage persistent');
+      }
 
       output = true;
       ctx.logger.info('healthCheck end');
@@ -4017,7 +4061,7 @@ exports.licenseInfo = function(req, res) {
       yield ctx.initTenantCache();
       ctx.logger.debug('licenseInfo start');
 
-      let licenseInfo = yield tenantManager.getTenantLicense(ctx);
+      let [licenseInfo] = yield tenantManager.getTenantLicense(ctx);
       Object.assign(output.licenseInfo, licenseInfo);
 
       var precisionSum = {};
@@ -4033,7 +4077,7 @@ exports.licenseInfo = function(req, res) {
           view: {min: 0, avr: 0, max: 0}
         };
       }
-      var redisRes = yield editorData.getEditorConnections(ctx);
+      var redisRes = yield editorStat.getEditorConnections(ctx);
       const now = Date.now();
       if (redisRes.length > 0) {
         let expDocumentsStep95 = expDocumentsStep * 0.95;
@@ -4094,8 +4138,8 @@ exports.licenseInfo = function(req, res) {
       }
       const nowUTC = getLicenseNowUtc();
       let execRes;
-      execRes = yield editorData.getPresenceUniqueUser(ctx, nowUTC);
-      output.quota.edit.connectionsCount = yield editorData.getEditorConnectionsCount(ctx, connections);
+      execRes = yield editorStat.getPresenceUniqueUser(ctx, nowUTC);
+      output.quota.edit.connectionsCount = yield editorStat.getEditorConnectionsCount(ctx, connections);
       output.quota.edit.usersCount.unique = execRes.length;
       execRes.forEach(function(elem) {
         if (elem.anonym) {
@@ -4103,8 +4147,8 @@ exports.licenseInfo = function(req, res) {
         }
       });
 
-      execRes = yield editorData.getPresenceUniqueViewUser(ctx, nowUTC);
-      output.quota.view.connectionsCount = yield editorData.getLiveViewerConnectionsCount(ctx, connections);
+      execRes = yield editorStat.getPresenceUniqueViewUser(ctx, nowUTC);
+      output.quota.view.connectionsCount = yield editorStat.getLiveViewerConnectionsCount(ctx, connections);
       output.quota.view.usersCount.unique = execRes.length;
       execRes.forEach(function(elem) {
         if (elem.anonym) {
@@ -4112,8 +4156,8 @@ exports.licenseInfo = function(req, res) {
         }
       });
 
-      let byMonth = yield editorData.getPresenceUniqueUsersOfMonth(ctx);
-      let byMonthView = yield editorData.getPresenceUniqueViewUsersOfMonth(ctx);
+      let byMonth = yield editorStat.getPresenceUniqueUsersOfMonth(ctx);
+      let byMonthView = yield editorStat.getPresenceUniqueViewUsersOfMonth(ctx);
       let byMonthMerged = [];
       for (let i in byMonth) {
         if (byMonth.hasOwnProperty(i)) {
@@ -4148,7 +4192,6 @@ exports.licenseInfo = function(req, res) {
     }
   });
 };
-
 function validateInputParams(ctx, authRes, command) {
   const commandsWithoutKey = ['version', 'license', 'getForgottenList'];
   const isValidWithoutKey = commandsWithoutKey.includes(command.c);
@@ -4196,23 +4239,35 @@ function* findForgottenFile(ctx, docId) {
 
 function* commandLicense(ctx) {
   const nowUTC = getLicenseNowUtc();
-  const users = yield editorData.getPresenceUniqueUser(ctx, nowUTC);
-  const users_view = yield editorData.getPresenceUniqueViewUser(ctx, nowUTC);
-  const licenseInfo = yield tenantManager.getTenantLicense(ctx);
+  const users = yield editorStat.getPresenceUniqueUser(ctx, nowUTC);
+  const users_view = yield editorStat.getPresenceUniqueViewUser(ctx, nowUTC);
+  const [licenseInfo, licenseOriginal] = yield tenantManager.getTenantLicense(ctx);
 
   return {
-    license: utils.convertLicenseInfoToFileParams(licenseInfo),
+    license: licenseOriginal || utils.convertLicenseInfoToFileParams(licenseInfo),
     server: utils.convertLicenseInfoToServerParams(licenseInfo),
     quota: { users, users_view }
   };
 }
 
+async function proxyCommand(ctx, req, params) {
+  const tenCallbackRequestTimeout = ctx.getCfg('services.CoAuthoring.server.callbackRequestTimeout', cfgCallbackRequestTimeout);
+  //todo gen shardkey as in sdkjs
+  const shardkey = params.key;
+  const baseUrl = utils.getBaseUrlByRequest(ctx, req);
+  let url = `${baseUrl}/command?&${constants.SHARD_KEY_API_NAME}=${encodeURIComponent(shardkey)}`;
+  for (let name in req.query) {
+    url += `&${name}=${encodeURIComponent(req.query[name])}`;
+  }
+  ctx.logger.info('commandFromServer proxy request with "key" to correctly process commands in sharded cluster to url:%s', url);
+  return await utils.postRequestPromise(ctx, url, req.body, null, req.body.length, tenCallbackRequestTimeout, undefined, req.headers);
+}
 /**
  * Server commands handler.
  * @param ctx Local context.
  * @param params Request parameters.
  * @param req Request object.
- * @param output{{ key: string, error: number, version: undefined | string }} Mutable. Response body.
+ * @param output{{ key: string, error: number, version: undefined | string, users: [string]}}} Mutable. Response body.
  * @returns undefined.
  */
 function* commandHandle(ctx, params, req, output) {
@@ -4226,7 +4281,12 @@ function* commandHandle(ctx, params, req, output) {
       //If no files in the database means they have not been edited.
       const selectRes = yield taskResult.select(ctx, docId);
       if (selectRes.length > 0) {
-        output.error = yield* bindEvents(ctx, docId, params.callback, utils.getBaseUrlByRequest(ctx, req), undefined, params.userdata);
+        let sendData = yield* bindEvents(ctx, docId, params.callback, utils.getBaseUrlByRequest(ctx, req), undefined, params.userdata);
+        if (sendData) {
+          output.users = sendData.users || [];
+        } else {
+          output.error = commonDefines.c_oAscServerCommandErrors.ParseError;
+        }
       } else {
         output.error = commonDefines.c_oAscServerCommandErrors.DocumentIdError;
       }
@@ -4234,7 +4294,7 @@ function* commandHandle(ctx, params, req, output) {
     }
     case 'drop': {
       if (params.userid) {
-        yield* publish(ctx, {type: commonDefines.c_oPublishType.drop, ctx: ctx, docId: docId, users: [params.userid], description: params.description});
+        yield publish(ctx, {type: commonDefines.c_oPublishType.drop, ctx: ctx, docId: docId, users: [params.userid], description: params.description});
       } else if (params.users) {
         const users = (typeof params.users === 'string') ? JSON.parse(params.users) : params.users;
         yield* dropUsersFromDocument(ctx, docId, users);
@@ -4261,7 +4321,7 @@ function* commandHandle(ctx, params, req, output) {
     }
     case 'meta': {
       if (params.meta) {
-        yield* publish(ctx, {type: commonDefines.c_oPublishType.meta, ctx: ctx, docId: docId, meta: params.meta});
+        yield publish(ctx, {type: commonDefines.c_oPublishType.meta, ctx: ctx, docId: docId, meta: params.meta});
       } else {
         output.error = commonDefines.c_oAscServerCommandErrors.UnknownCommand;
       }
@@ -4291,7 +4351,7 @@ function* commandHandle(ctx, params, req, output) {
         break;
       }
 
-      yield storage.deleteObject(ctx, forgottenFile, tenForgottenFiles);
+      yield storage.deletePath(ctx, docId, tenForgottenFiles);
       break;
     }
     case 'getForgottenList': {
@@ -4319,8 +4379,9 @@ function* commandHandle(ctx, params, req, output) {
 // Command from the server (specifically teamlab)
 exports.commandFromServer = function (req, res) {
   return co(function* () {
-    const output = { key: 'commandFromServer', error: commonDefines.c_oAscServerCommandErrors.NoError, version: undefined };
+    const output = { key: 'commandFromServer', error: commonDefines.c_oAscServerCommandErrors.NoError, version: undefined, users: undefined};
     const ctx = new operationContext.Context();
+    let postRes = null;
     try {
       ctx.initFromRequest(req);
       yield ctx.initTenantCache();
@@ -4331,18 +4392,27 @@ exports.commandFromServer = function (req, res) {
       output.key = params.key;
       output.error = validateInputParams(ctx, authRes, params);
       if (output.error === commonDefines.c_oAscServerCommandErrors.NoError) {
-        ctx.logger.debug('commandFromServer: c = %s', params.c);
-        yield *commandHandle(ctx, params, req, output);
+        if (params.key && !req.query[constants.SHARD_KEY_API_NAME] && !req.query[constants.SHARD_KEY_WOPI_NAME] && process.env.DEFAULT_SHARD_KEY) {
+          postRes = yield proxyCommand(ctx, req, params);
+        } else {
+          ctx.logger.debug('commandFromServer: c = %s', params.c);
+          yield* commandHandle(ctx, params, req, output);
+        }
       }
     } catch (err) {
       output.error = commonDefines.c_oAscServerCommandErrors.UnknownError;
       ctx.logger.error('Error commandFromServer: %s', err.stack);
     } finally {
-      const outputBuffer = Buffer.from(JSON.stringify(output), 'utf8');
+      let outputBuffer;
+      if (postRes) {
+        outputBuffer = postRes.body;
+      } else {
+        outputBuffer = Buffer.from(JSON.stringify(output), 'utf8');
+      }
       res.setHeader('Content-Type', 'application/json');
       res.setHeader('Content-Length', outputBuffer.length);
       res.send(outputBuffer);
-      ctx.logger.info('commandFromServer end : %j', output);
+      ctx.logger.info('commandFromServer end : %s', outputBuffer);
     }
   });
 };
@@ -4355,7 +4425,7 @@ exports.shutdown = function(req, res) {
       ctx.initFromRequest(req);
       yield ctx.initTenantCache();
       ctx.logger.info('shutdown start');
-      output = yield shutdown.shutdown(ctx, editorData, req.method === 'PUT');
+      output = yield shutdown.shutdown(ctx, editorStat, req.method === 'PUT');
     } catch (err) {
       ctx.logger.error('shutdown error %s', err.stack);
     } finally {
@@ -4364,4 +4434,23 @@ exports.shutdown = function(req, res) {
       ctx.logger.info('shutdown end');
     }
   });
+};
+exports.getEditorConnectionsCount = function (req, res) {
+  let ctx = new operationContext.Context();
+  let count = 0;
+  try {
+    ctx.initFromRequest(req);
+    for (let i = 0; i < connections.length; ++i) {
+      let conn = connections[i];
+      if (!(conn.isCloseCoAuthoring || (conn.user && conn.user.view))) {
+        count++;
+      }
+    }
+    ctx.logger.info('getConnectionsCount count=%d', count);
+  } catch (err) {
+    ctx.logger.error('getConnectionsCount error %s', err.stack);
+  } finally {
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(count.toString());
+  }
 };

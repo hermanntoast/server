@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2023
+ * (c) Copyright Ascensio System SIA 2010-2024
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -57,15 +57,36 @@ const utils = require('./../../Common/sources/utils');
 const commonDefines = require('./../../Common/sources/commondefines');
 const operationContext = require('./../../Common/sources/operationContext');
 const tenantManager = require('./../../Common/sources/tenantManager');
-const configStorage = config.get('storage');
+const staticRouter = require('./routes/static');
+const ms = require('ms');
 
 const cfgWopiEnable = config.get('wopi.enable');
+const cfgWopiDummyEnable = config.get('wopi.dummy.enable');
 const cfgHtmlTemplate = config.get('wopi.htmlTemplate');
 const cfgTokenEnableBrowser = config.get('services.CoAuthoring.token.enable.browser');
 const cfgTokenEnableRequestInbox = config.get('services.CoAuthoring.token.enable.request.inbox');
 const cfgTokenEnableRequestOutbox = config.get('services.CoAuthoring.token.enable.request.outbox');
 const cfgLicenseFile = config.get('license.license_file');
 const cfgDownloadMaxBytes = config.get('FileConverter.converter.maxDownloadBytes');
+
+if (false) {
+	var cluster = require('cluster');
+	cluster.schedulingPolicy = cluster.SCHED_RR
+	if (cluster.isMaster) {
+		let workersCount = 2;
+		logger.warn('start cluster with %s workers %s', workersCount, cluster.schedulingPolicy);
+		for (let nIndexWorker = 0; nIndexWorker < workersCount; ++nIndexWorker) {
+			var worker = cluster.fork().process;
+			logger.warn('worker %s started.', worker.pid);
+		}
+
+		cluster.on('exit', function (worker) {
+			logger.warn('worker %s died. restart...', worker.process.pid);
+			cluster.fork();
+		});
+		return;
+	}
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -74,30 +95,24 @@ app.set("views", path.resolve(process.cwd(), cfgHtmlTemplate));
 app.set("view engine", "ejs");
 const server = http.createServer(app);
 
-let licenseInfo, licenseOriginal, updatePluginsTime, userPlugins, pluginsLoaded;
+let licenseInfo, licenseOriginal, updatePluginsTime, userPlugins;
+const updatePluginsCacheExpire = ms("5m");
 
 const updatePlugins = (eventType, filename) => {
-	operationContext.global.logger.info('update Folder: %s ; %s', eventType, filename);
-	if (updatePluginsTime && 1000 >= (new Date() - updatePluginsTime)) {
-		return;
-	}
 	operationContext.global.logger.info('update Folder true: %s ; %s', eventType, filename);
-	updatePluginsTime = new Date();
-	pluginsLoaded = false;
+	userPlugins = undefined;
 };
-const readLicense = function*() {
-	[licenseInfo, licenseOriginal] = yield* license.readLicense(cfgLicenseFile);
+const readLicense = async function () {
+	[licenseInfo, licenseOriginal] = await license.readLicense(cfgLicenseFile);
 };
-const updateLicense = () => {
-	return co(function*() {
-		try {
-			yield* readLicense();
-			docsCoServer.setLicenseInfo(licenseInfo, licenseOriginal);
-			operationContext.global.logger.info('End updateLicense');
-		} catch (err) {
-			operationContext.global.logger.error('updateLicense error: %s', err.stack);
-		}
-	});
+const updateLicense = async () => {
+	try {
+		await readLicense();
+		await docsCoServer.setLicenseInfo(operationContext.global, licenseInfo, licenseOriginal);
+		operationContext.global.logger.info('End updateLicense');
+	} catch (err) {
+		operationContext.global.logger.error('updateLicense error: %s', err.stack);
+	}
 };
 
 operationContext.global.logger.warn('Express server starting...');
@@ -112,48 +127,16 @@ updateLicense();
 fs.watchFile(cfgLicenseFile, updateLicense);
 setInterval(updateLicense, 86400000);
 
-if (config.has('services.CoAuthoring.server.static_content')) {
-	const staticContent = config.get('services.CoAuthoring.server.static_content');
-	for (let i in staticContent) {
-		if (staticContent.hasOwnProperty(i)) {
-			app.use(i, express.static(staticContent[i]['path'], staticContent[i]['options']));
-		}
-	}
-}
-
-if (configStorage.has('fs.folderPath')) {
-	const cfgBucketName = configStorage.get('bucketName');
-	const cfgStorageFolderName = configStorage.get('storageFolderName');
-	app.use('/' + cfgBucketName + '/' + cfgStorageFolderName, (req, res, next) => {
-		const index = req.url.lastIndexOf('/');
-		if ('GET' === req.method && index > 0) {
-			let sendFileOptions = {
-				root: configStorage.get('fs.folderPath'), dotfiles: 'deny', headers: {
-					'Content-Disposition': 'attachment'
-				}
-			};
-			const urlParsed = urlModule.parse(req.url);
-			if (urlParsed && urlParsed.pathname) {
-				const filename = decodeURIComponent(path.basename(urlParsed.pathname));
-				sendFileOptions.headers['Content-Type'] = mime.getType(filename);
-			}
-			const realUrl = decodeURI(req.url.substring(0, index));
-			res.sendFile(realUrl, sendFileOptions, (err) => {
-				if (err) {
-					operationContext.global.logger.error(err);
-					res.status(400).end();
-				}
-			});
-		} else {
-			res.sendStatus(404);
-		}
-	});
-}
-
 try {
-	fs.watch(config.get('services.CoAuthoring.plugins.path'), updatePlugins);
+	let staticContent = config.get('services.CoAuthoring.server.static_content');
+	let pluginsUri = config.get('services.CoAuthoring.plugins.uri');
+	let pluginsPath = undefined;
+	if (staticContent[pluginsUri]) {
+		pluginsPath = staticContent[pluginsUri].path;
+	}
+	fs.watch(pluginsPath, updatePlugins);
 } catch (e) {
-	operationContext.global.logger.warn('Failed to subscribe to plugin folder updates. When changing the list of plugins, you must restart the server. https://nodejs.org/docs/latest/api/fs.html#fs_availability');
+	operationContext.global.logger.warn('Failed to subscribe to plugin folder updates. When changing the list of plugins, you must restart the server. https://nodejs.org/docs/latest/api/fs.html#fs_availability. %s', e.stack);
 }
 
 // If you want to use 'development' and 'production',
@@ -172,7 +155,7 @@ docsCoServer.install(server, () => {
 			try {
 				ctx.initFromRequest(req);
 				yield ctx.initTenantCache();
-				let licenseInfo = yield tenantManager.getTenantLicense(ctx);
+				let [licenseInfo] = yield tenantManager.getTenantLicense(ctx);
 				let buildVersion = commonDefines.buildVersion;
 				let buildNumber = commonDefines.buildNumber;
 				let buildDate, packageType, customerId = "", alias = "";
@@ -191,14 +174,17 @@ docsCoServer.install(server, () => {
 			}
 		});
 	});
+
+	app.use('/', staticRouter);
+
 	const rawFileParser = bodyParser.raw(
 		{inflate: true, limit: config.get('services.CoAuthoring.server.limits_tempfile_upload'), type: function() {return true;}});
 	const urleEcodedParser = bodyParser.urlencoded({ extended: false });
 	let forms = multer();
 
 	app.get('/coauthoring/CommandService.ashx', utils.checkClientIp, rawFileParser, docsCoServer.commandFromServer);
-	app.post('/coauthoring/CommandService.ashx', utils.checkClientIp, rawFileParser,
-		docsCoServer.commandFromServer);
+	app.post('/coauthoring/CommandService.ashx', utils.checkClientIp, rawFileParser, docsCoServer.commandFromServer);
+	app.post('/command', utils.checkClientIp, rawFileParser, docsCoServer.commandFromServer);
 
 	app.get('/ConvertService.ashx', utils.checkClientIp, rawFileParser, converterService.convertXml);
 	app.post('/ConvertService.ashx', utils.checkClientIp, rawFileParser, converterService.convertXml);
@@ -230,6 +216,7 @@ docsCoServer.install(server, () => {
 	app.post('/savefile/:docid', rawFileParser, canvasService.saveFile);
 	app.get('/printfile/:docid/:filename', canvasService.printFile);
 	app.get('/downloadfile/:docid', canvasService.downloadFile);
+	app.post('/downloadfile/:docid', rawFileParser, canvasService.downloadFile);
 	app.get('/healthcheck', utils.checkClientIp, docsCoServer.healthCheck);
 
 	app.get('/baseurl', (req, res) => {
@@ -255,6 +242,7 @@ docsCoServer.install(server, () => {
 	app.get('/info/info.json', utils.checkClientIp, docsCoServer.licenseInfo);
 	app.put('/internal/cluster/inactive', utils.checkClientIp, docsCoServer.shutdown);
 	app.delete('/internal/cluster/inactive', utils.checkClientIp, docsCoServer.shutdown);
+	app.get('/internal/connections/edit', docsCoServer.getEditorConnectionsCount);
 
 	function checkWopiEnable(req, res, next) {
 		//todo may be move code into wopiClient or wopiClient.discovery...
@@ -273,17 +261,39 @@ docsCoServer.install(server, () => {
 				res.sendStatus(404);
 			});
 	}
+	function checkWopiDummyEnable(req, res, next) {
+		//todo may be move code into wopiClient or wopiClient.discovery...
+		let ctx = new operationContext.Context();
+		ctx.initFromRequest(req);
+		ctx.initTenantCache()
+			.then(() => {
+				const tenWopiEnable = ctx.getCfg('wopi.enable', cfgWopiEnable);
+				const tenWopiDummyEnable = ctx.getCfg('wopi.dummy.enable', cfgWopiDummyEnable);
+				if (tenWopiEnable && tenWopiDummyEnable) {
+					next();
+				} else {
+					res.sendStatus(404);
+				}
+			}).catch((err) => {
+				ctx.logger.error('checkWopiDummyEnable error: %s', err.stack);
+				res.sendStatus(404);
+			});
+	}
 	//todo dest
 	let fileForms = multer({limits: {fieldSize: cfgDownloadMaxBytes}});
 	app.get('/hosting/discovery', checkWopiEnable, utils.checkClientIp, wopiClient.discovery);
 	app.get('/hosting/capabilities', checkWopiEnable, utils.checkClientIp, wopiClient.collaboraCapabilities);
-	app.post('/lool/convert-to/:format?', checkWopiEnable, utils.checkClientIp, urleEcodedParser, fileForms.single('data'), converterService.convertTo);
-	app.post('/cool/convert-to/:format?', checkWopiEnable, utils.checkClientIp, urleEcodedParser, fileForms.single('data'), converterService.convertTo);
+	app.post('/lool/convert-to/:format?', checkWopiEnable, utils.checkClientIp, urleEcodedParser, fileForms.any(), converterService.convertTo);
+	app.post('/cool/convert-to/:format?', checkWopiEnable, utils.checkClientIp, urleEcodedParser, fileForms.any(), converterService.convertTo);
 	app.post('/hosting/wopi/:documentType/:mode', checkWopiEnable, urleEcodedParser, forms.none(), utils.lowercaseQueryString, wopiClient.getEditorHtml);
 	app.post('/hosting/wopi/convert-and-edit/:ext/:targetext', checkWopiEnable, urleEcodedParser, forms.none(), utils.lowercaseQueryString, wopiClient.getConverterHtml);
 	app.get('/hosting/wopi/convert-and-edit-handler', checkWopiEnable, utils.lowercaseQueryString, converterService.getConverterHtmlHandler);
+	app.get('/wopi/files/:docid', apicache.middleware("5 minutes"), checkWopiDummyEnable, utils.lowercaseQueryString, wopiClient.dummyCheckFileInfo);
+	app.post('/wopi/files/:docid', checkWopiDummyEnable, wopiClient.dummyOk);
+	app.get('/wopi/files/:docid/contents', apicache.middleware("5 minutes"), checkWopiDummyEnable, wopiClient.dummyGetFile);
+	app.post('/wopi/files/:docid/contents', checkWopiDummyEnable, wopiClient.dummyOk);
 
-	app.post('/dummyCallback', utils.checkClientIp, rawFileParser, function(req, res){
+	app.post('/dummyCallback', utils.checkClientIp, apicache.middleware("5 minutes"), rawFileParser, function(req, res){
 		let ctx = new operationContext.Context();
 		ctx.initFromRequest(req);
 		//yield ctx.initTenantCache();//no need
@@ -292,12 +302,12 @@ docsCoServer.install(server, () => {
 	});
 
 	const sendUserPlugins = (res, data) => {
-		pluginsLoaded = true;
 		res.setHeader('Content-Type', 'application/json');
 		res.send(JSON.stringify(data));
 	};
 	app.get('/plugins.json', (req, res) => {
-		if (userPlugins && pluginsLoaded) {
+		//fs.watch is not reliable. Set cache expiry time
+		if (userPlugins && (new Date() - updatePluginsTime) < updatePluginsCacheExpire) {
 			sendUserPlugins(res, userPlugins);
 			return;
 		}
@@ -334,6 +344,7 @@ docsCoServer.install(server, () => {
 					}
 				}
 
+				updatePluginsTime = new Date();
 				userPlugins = {'url': '', 'pluginsData': result, 'autostart': pluginsAutostart};
 				sendUserPlugins(res, userPlugins);
 			});
@@ -387,11 +398,16 @@ docsCoServer.install(server, () => {
 			}
 		});
 	});
+	app.use((err, req, res, next) => {
+		let ctx = new operationContext.Context();
+		ctx.initFromRequest(req);
+		ctx.logger.error('default error handler:%s', err.stack);
+		res.sendStatus(500);
+	});
 });
 
 process.on('uncaughtException', (err) => {
-	operationContext.global.logger.error((new Date).toUTCString() + ' uncaughtException:', err.message);
-	operationContext.global.logger.error(err.stack);
+	operationContext.global.logger.error('uncaughtException:%s', err.stack);
 	logger.shutdown(() => {
 		process.exit(1);
 	});

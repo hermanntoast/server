@@ -1,5 +1,5 @@
 /*
- * (c) Copyright Ascensio System SIA 2010-2023
+ * (c) Copyright Ascensio System SIA 2010-2024
  *
  * This program is a free software product. You can redistribute it and/or
  * modify it under the terms of the GNU Affero General Public License (AGPL)
@@ -32,6 +32,7 @@
 
 'use strict';
 
+const config = require("config");
 const constants = require('./constants');
 
 function InputCommand(data, copyExplicit) {
@@ -108,12 +109,15 @@ function InputCommand(data, copyExplicit) {
     this['status_info_in'] = data['status_info_in'];
     this['attempt'] = data['attempt'];
     this['convertToOrigin'] = data['convertToOrigin'];
+    this['isSaveAs'] = data['isSaveAs'];
+    this['saveAsPath'] = data['saveAsPath'];
     if (copyExplicit) {
       this['withAuthorization'] = data['withAuthorization'];
       this['externalChangeInfo'] = data['externalChangeInfo'];
       this['wopiParams'] = data['wopiParams'];
       this['builderParams'] = data['builderParams'];
       this['userconnectiondocid'] = data['userconnectiondocid'];
+      this['originformat'] = data['originformat'];
     }
   } else {
     this['c'] = undefined;//string command
@@ -169,6 +173,9 @@ function InputCommand(data, copyExplicit) {
     this['status_info_in'] = undefined;
     this['attempt'] = undefined;
     this['convertToOrigin'] = undefined;
+    this['originformat'] = undefined;
+    this['isSaveAs'] = undefined;
+    this['saveAsPath'] = undefined;
   }
 }
 InputCommand.prototype = {
@@ -225,6 +232,12 @@ InputCommand.prototype = {
   },
   setFormat: function(data) {
     this['format'] = data;
+  },
+  getOriginFormat: function() {
+    return this['originformat'];
+  },
+  setOriginFormat: function(data) {
+    this['originformat'] = data;
   },
   getUrl: function() {
     return this['url'];
@@ -355,8 +368,12 @@ InputCommand.prototype = {
   getJsonParams: function() {
     return this['jsonparams'];
   },
-  setJsonParams: function(data) {
-    this['jsonparams'] = data;
+  appendJsonParams: function (data) {
+    if (this['jsonparams']) {
+      config.util.extendDeep(this['jsonparams'], data);
+    } else {
+      this['jsonparams'] = data;
+    }
   },
   getLCID: function() {
     return this['lcid'];
@@ -495,6 +512,18 @@ InputCommand.prototype = {
   },
   setConvertToOrigin: function(data) {
     this['convertToOrigin'] = data;
+  },
+  getIsSaveAs: function() {
+    return this['isSaveAs'];
+  },
+  setIsSaveAs: function(data) {
+    this['isSaveAs'] = data;
+  },
+  getSaveAsPath: function() {
+    return this['saveAsPath'];
+  },
+  setSaveAsPath: function(data) {
+    this['saveAsPath'] = data;
   }
 };
 
@@ -888,11 +917,11 @@ OutputSfcData.prototype.getUserData= function() {
 OutputSfcData.prototype.setUserData = function(data) {
   return this['userdata'] = data;
 };
-OutputSfcData.prototype.getFormData= function() {
-  return this['formdata'];
+OutputSfcData.prototype.getFormsDataUrl= function() {
+  return this['formsdataurl'];
 };
-OutputSfcData.prototype.setFormData = function(data) {
-  return this['formdata'] = data;
+OutputSfcData.prototype.setFormsDataUrl = function(data) {
+  return this['formsdataurl'] = data;
 };
 OutputSfcData.prototype.getLastSave = function() {
   return this['lastsave']
